@@ -103,14 +103,25 @@ _fileclasses
 
 ### 同步脚本
 
-插件仓库与 Obsidian vault 的部署目录之间用 `sync.sh` 双向同步：
+插件仓库与 Obsidian vault 的部署目录之间用 `sync.sh` 同步：
 
 ```bash
-./sync.sh to-vault      # 仓库 → vault：把改好的插件部署到 Obsidian，重载后生效
-./sync.sh from-vault    # vault → 仓库：把 vault 里现场改的 main.js 收回仓库，再 git commit
+./sync.sh to-vault                 # 仓库 → vault：把改好的插件部署到 Obsidian
+./sync.sh from-vault               # vault → 仓库：把 vault 里现场改的文件收回仓库
+./sync.sh deploy "改了什么"         # 一条命令：部署到 vault + git commit + git push
 ```
 
+`deploy` 是最常用的：改完代码执行它，脚本会列出本次改动、部署到 vault、提交并推送，
+最后提示去 Obsidian 重载插件。若仓库无改动或远端已是最新，会跳过对应步骤。
+
 默认目标目录是本机 vault 路径，可用 `VAULT_DIR=/别的/路径 ./sync.sh to-vault` 覆盖。
+
+### 改完之后如何生效
+
+`main.js` 是 Obsidian 直接加载的文件，没有编译步骤。部署后需要在 Obsidian 里重载：
+
+- **只改逻辑**：设置 → 第三方插件 → 关闭再打开本插件（约 1 秒）
+- **改了 `styles.css`**：`Ctrl/Cmd+P` → `Reload app without saving`（整库重载，样式才一定刷新）
 
 ### 版本
 
