@@ -23,6 +23,8 @@ deploy_to_vault() {
     [ -f "$REPO/$f" ] || { echo "仓库缺少文件：$f" >&2; exit 1; }
     cp "$REPO/$f" "$VAULT/$f"
   done
+  # Hot Reload 插件靠 .hotreload 标记决定要不要监听本插件；标记丢了会自动重载失效，这里兜底重建
+  touch "$VAULT/.hotreload"
 }
 
 case "${1:-}" in

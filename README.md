@@ -123,6 +123,12 @@ _fileclasses
 - **只改逻辑**：设置 → 第三方插件 → 关闭再打开本插件（约 1 秒）
 - **改了 `styles.css`**：`Ctrl/Cmd+P` → `Reload app without saving`（整库重载，样式才一定刷新）
 
+如果 vault 里装了 **Hot Reload** 插件（pjeby），上面两步都可以省掉：
+
+- Hot Reload 只监听「目录里有 `.git` 或 `.hotreload` 标记」的插件，所以本插件的部署目录里需要 `.hotreload` 文件
+- `./sync.sh to-vault` 和 `./sync.sh deploy` 每次都会自动重建这个标记，无需手工维护
+- 标记存在且 Hot Reload 已启用时，部署一写文件就会自动重载插件，并在 Obsidian 里弹出提示
+
 ### 版本
 
 `manifest.json` 当前版本 **0.7.10**（需 Obsidian ≥ 1.8.9）。README 上方「v0.6.3」为新增中文文档分类那一节的版本号，历史小节按版本倒序保留。
