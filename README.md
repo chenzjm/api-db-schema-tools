@@ -1,4 +1,4 @@
-# 接口与数据库结构工具 v0.8.0
+# 接口与数据库结构工具 v0.8.2
 
 Schema Studio 用于维护接口字段和数据库字段。底层仍然是普通 Markdown、YAML Frontmatter 和 Wikilink；Fileclass 提供属性定义，Schema Tools 负责 JSON/DDL 导入、字段管理和精准引用。本仓库的接口字段属性名称统一使用中文，接口协议里的字段名、路径和类型保留原始写法。
 
