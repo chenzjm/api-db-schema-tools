@@ -177,7 +177,9 @@ function parseCreateTables(sql) {
       if (!nameMatch) continue;
       const name = unquoteIdent(nameMatch[1]);
       const rest = nameMatch[2].trim();
-      const stop = /\s+(?=NOT\s+NULL|NULL\b|DEFAULT\b|PRIMARY\s+KEY|UNIQUE\b|REFERENCES\b|COMMENT\b|COLLATE\b|CHECK\b|GENERATED\b|AUTO_INCREMENT\b)/i;
+      // CONSTRAINT 必须在列里：Oracle 导出常见「<类型> constraint SYS_xxx check (...)」，
+      // 少了它就会把 constraint 及其后的内容一起吃进数据类型（如 "DATE constraint SYS_C0050516"）。
+      const stop = /\s+(?=CONSTRAINT\b|NOT\s+NULL|NULL\b|DEFAULT\b|PRIMARY\s+KEY|UNIQUE\b|REFERENCES\b|COMMENT\b|COLLATE\b|CHECK\b|GENERATED\b|AUTO_INCREMENT\b)/i;
       const stopMatch = stop.exec(rest);
       const type = normalizeType(stopMatch ? rest.slice(0, stopMatch.index) : rest);
       const constraints = stopMatch ? rest.slice(stopMatch.index).trim() : '';
@@ -269,6 +271,15 @@ function bool(v, fallback = false) { return typeof v === 'boolean' ? v : fallbac
 function arrish(v) { return Array.isArray(v) ? v : (v == null ? [] : [v]); }
 function fmLinkPath(v) { return core.parseWikiTarget(v || ''); }
 function basenameNoExt(path) { return String(path || '').split('/').pop().replace(/\.md$/i, ''); }
+// 列/字段文档的文件名格式是「<对象名>__<字段名>」。当 frontmatter 里的字段名缺失或被清空时，
+// 用它从文件名还原真实字段名——直接拿整个文件名会带上表名前缀，导致与 DDL/JSON 里的字段匹配不上。
+function memberNameFromFilename(path, ownerName) {
+  const base = basenameNoExt(path);
+  const owner = String(ownerName || '');
+  if (!owner) return base;
+  const prefix = `${owner}__`;
+  return base.startsWith(prefix) ? base.slice(prefix.length) : base;
+}
 function escHtml(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 // Find a standalone @ trigger in the text immediately before the cursor.
@@ -380,6 +391,17 @@ function stripCacheKeys(obj) {
 }
 function schemaKeyCandidates(domain, key) {
   return SCHEMA_KEY_ALIASES[domain]?.[key] || [key];
+}
+// 这些是业务字段的身份信息：导入值缺失时绝不能把文件里已有的值覆盖成空。
+// 一旦被写空，该文件就会与 DDL/JSON 里的字段匹配不上，后续导入会把它当成新字段、因重名直接中断。
+const SCHEMA_GUARDED_KEYS = { api: ['path', 'name', 'data_type'], db: ['name', 'data_type'] };
+function dropBlankGuardedValues(domain, props) {
+  for (const key of SCHEMA_GUARDED_KEYS[domain] || []) {
+    const value = schemaValue(props, domain, key);
+    if (value === undefined || value === null || String(value).trim() === '') {
+      for (const candidate of schemaKeyCandidates(domain, key)) delete props[candidate];
+    }
+  }
 }
 function schemaValue(fm, domain, key) {
   for (const candidate of schemaKeyCandidates(domain, key)) {
@@ -992,10 +1014,14 @@ class SchemaToolsPlugin extends Plugin {
       const fm = stripCacheKeys(this.app.metadataCache.getFileCache(file)?.frontmatter || {});
       const apiPath = fmLinkPath(schemaValue(fm,'api','api'));
       const directionValue = schemaValue(fm,'api','direction');
+      const apiName = basenameNoExt(apiPath);
+      const direction = normalizeDirection(directionValue) || directionValue || '';
+      // 文件名格式「<接口名>__<方向>__<字段路径>」，字段名缺失时按同样规则剥掉前缀还原
+      const fallbackName = memberNameFromFilename(memberNameFromFilename(file.path, apiName), direction);
       return {
-        file, filePath: file.path, apiPath, apiName: basenameNoExt(apiPath),
-        direction: normalizeDirection(directionValue) || directionValue || '', path: schemaValue(fm,'api','path') || '',
-        parent_path: schemaValue(fm,'api','parent_path') || '', name: schemaValue(fm,'api','name') || basenameNoExt(file.path),
+        file, filePath: file.path, apiPath, apiName,
+        direction, path: schemaValue(fm,'api','path') || '',
+        parent_path: schemaValue(fm,'api','parent_path') || '', name: schemaValue(fm,'api','name') || fallbackName,
         shape: schemaValue(fm,'api','shape') || '', data_type: schemaValue(fm,'api','data_type') || '',
         schema_orphaned: this.isSchemaOrphaned(file.path), order: Number(schemaValue(fm,'api','order') || 0), fm,
       };
@@ -1006,9 +1032,11 @@ class SchemaToolsPlugin extends Plugin {
     return this.app.vault.getMarkdownFiles().filter(f => f.path.startsWith(prefix)).map(file => {
       const fm = stripCacheKeys(this.app.metadataCache.getFileCache(file)?.frontmatter || {});
       const tablePath = fmLinkPath(schemaValue(fm,'db','table'));
+      const table = basenameNoExt(tablePath);
       return {
-        file, filePath: file.path, tablePath, table: basenameNoExt(tablePath),
-        name: schemaValue(fm,'db','name') || basenameNoExt(file.path), data_type: schemaValue(fm,'db','data_type') || '',
+        file, filePath: file.path, tablePath, table,
+        // 字段名缺失时从文件名还原（剥掉「<表名>__」前缀），否则整串文件名会被当成列名
+        name: schemaValue(fm,'db','name') || memberNameFromFilename(file.path, table), data_type: schemaValue(fm,'db','data_type') || '',
         nullable: bool(schemaValue(fm,'db','nullable'), true), primary_key: bool(schemaValue(fm,'db','primary_key')),
         indexed: bool(schemaValue(fm,'db','indexed')), schema_orphaned: this.isSchemaOrphaned(file.path),
         default_value: schemaValue(fm,'db','default_value') ?? '', references: schemaValue(fm,'db','references') || '',
@@ -2195,12 +2223,19 @@ class SchemaStudioModal extends Modal {
     await ensureFolder(this.app,apiDocPath.split('/').slice(0,-1).join('/'));
     const apiLink=`[[${apiDocPath.replace(/\.md$/,'')}]]`;
     if(!this.app.vault.getAbstractFileByPath(apiDocPath))await this.app.vault.create(apiDocPath,`# ${a.apiName}\n\n## Request\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Request]]\n\n## Response\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Response]]\n`);
-    const exMap=new Map(a.existing.map(x=>[x.path,x]));const className=this.plugin.getFieldDefinitions('api').className;const statePatch={};
+    const exMap=new Map(a.existing.map(x=>[x.path,x]));
+    // 兜底：按文件路径匹配，避免字段名丢失时把已存在的文档当成新建、因重名抛错中断整批导入
+    const exPathMap=new Map(a.existing.map(x=>[normalizePath(x.filePath),x]));
+    const className=this.plugin.getFieldDefinitions('api').className;const statePatch={};
     for(const r of a.incoming){const old=exMap.get(r.key);const props=stripCacheKeys(r);delete props.key;props.fileClass=props.fileClass||className;purgeSchemaInternalKeys(props);
       // 已存在的字段文档保留它自己的接口链接，不按设置里的目录改写
       if(!old){setSchemaValue(props,'api','api',apiLink);setSchemaValue(props,'api','direction',a.direction);}
+      if(old)dropBlankGuardedValues('api',props);
       if(old){await this.app.fileManager.processFrontMatter(old.file,fm=>{Object.assign(fm,props);purgeSchemaInternalKeys(fm);});statePatch[old.filePath]={source:'json-sample',orphaned:false,lastImportedAt:now};}
-      else{const path=normalizePath(`${folder}/${core.makeApiFieldFilename(a.apiName,a.direction,r.key)}.md`);await this.app.vault.create(path,`---\n${stringifyYaml(props)}---\n\n${noteBodyApiField(a.apiName,a.direction,canonicalSchemaRecord('api',props))}`);statePatch[path]={source:'json-sample',orphaned:false,lastImportedAt:now};}}
+      else{const path=normalizePath(`${folder}/${core.makeApiFieldFilename(a.apiName,a.direction,r.key)}.md`);
+        const byPath=exPathMap.get(path);
+        if(byPath){await this.app.fileManager.processFrontMatter(byPath.file,fm=>{Object.assign(fm,props);purgeSchemaInternalKeys(fm);});statePatch[byPath.filePath]={source:'json-sample',orphaned:false,lastImportedAt:now};}
+        else{await this.app.vault.create(path,`---\n${stringifyYaml(props)}---\n\n${noteBodyApiField(a.apiName,a.direction,canonicalSchemaRecord('api',props))}`);statePatch[path]={source:'json-sample',orphaned:false,lastImportedAt:now};}}}
     for(const d of a.diff.filter(x=>x.status==='removed')){const old=exMap.get(d.key);if(old){await this.app.fileManager.processFrontMatter(old.file,fm=>{purgeSchemaInternalKeys(fm);});statePatch[old.filePath]={source:'json-sample',orphaned:true,lastImportedAt:now};}}
     await this.plugin.patchSchemaState(statePatch);
   }
@@ -2280,6 +2315,8 @@ class SchemaStudioModal extends Modal {
     const now=new Date().toISOString();await ensureFolder(this.app,this.plugin.settings.dbColumnsFolder);const className=this.plugin.getFieldDefinitions('db').className;const statePatch={};
     for(const a of state.analysis){
       const exMap=new Map(a.existing.map(x=>[x.name,x]));
+      // 兜底：按文件路径匹配。字段名被清空/改名后按名字会匹配不上，直接走新建会撞上已存在的文件。
+      const exPathMap=new Map(a.existing.map(x=>[normalizePath(x.filePath),x]));
       // 表文档优先落在现有列文件已指向且确实存在的位置；只有确实无从判断时才用设置目录。
       const tableDocPath=this.resolveDbDocPath(a);
       await ensureFolder(this.app,tableDocPath.split('/').slice(0,-1).join('/'));
@@ -2289,8 +2326,14 @@ class SchemaStudioModal extends Modal {
         // 已存在的列文件保留它自己的 `数据表` 链接，不按设置里的目录改写
         if(!old)setSchemaValue(props,'db','table',tableLink);
         if(!r.default_value)for(const key of schemaKeyCandidates('db','default_value'))delete props[key];
+        // 导入值缺失时保留文件里已有的 字段名/数据类型，绝不写空
+        if(old)dropBlankGuardedValues('db',props);
         if(old){await this.app.fileManager.processFrontMatter(old.file,fm=>{Object.assign(fm,props);purgeSchemaInternalKeys(fm);if(!r.default_value)for(const key of schemaKeyCandidates('db','default_value'))delete fm[key];});statePatch[old.filePath]={source:'ddl',dialect:state.dialect,orphaned:false,lastImportedAt:now};}
-        else{const path=normalizePath(`${this.plugin.settings.dbColumnsFolder}/${core.makeDbColumnFilename(a.table,r.key)}.md`);await this.app.vault.create(path,`---\n${stringifyYaml(props)}---\n\n${noteBodyDbColumn(a.table,canonicalSchemaRecord('db',props))}`);statePatch[path]={source:'ddl',dialect:state.dialect,orphaned:false,lastImportedAt:now};}}
+        else{const path=normalizePath(`${this.plugin.settings.dbColumnsFolder}/${core.makeDbColumnFilename(a.table,r.key)}.md`);
+          // 名字没匹配上、但该文件确实存在时，按路径更新它，而不是新建（新建会因重名直接抛错中断整批导入）
+          const byPath=exPathMap.get(path);
+          if(byPath){dropBlankGuardedValues('db',props);await this.app.fileManager.processFrontMatter(byPath.file,fm=>{Object.assign(fm,props);purgeSchemaInternalKeys(fm);if(!r.default_value)for(const key of schemaKeyCandidates('db','default_value'))delete fm[key];});statePatch[byPath.filePath]={source:'ddl',dialect:state.dialect,orphaned:false,lastImportedAt:now};}
+          else{await this.app.vault.create(path,`---\n${stringifyYaml(props)}---\n\n${noteBodyDbColumn(a.table,canonicalSchemaRecord('db',props))}`);statePatch[path]={source:'ddl',dialect:state.dialect,orphaned:false,lastImportedAt:now};}}}
       for(const d of a.diff.filter(x=>x.status==='removed')){const old=exMap.get(d.key);if(old){await this.app.fileManager.processFrontMatter(old.file,fm=>{purgeSchemaInternalKeys(fm);});statePatch[old.filePath]={source:'ddl',dialect:state.dialect,orphaned:true,lastImportedAt:now};}}
     }
     await this.plugin.patchSchemaState(statePatch);
