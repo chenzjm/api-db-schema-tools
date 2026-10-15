@@ -353,8 +353,11 @@ const DEFAULTS = {
   dbDocsFolder: '03-数据库',
   apiFieldsFolder: '_data/api-fields',
   dbColumnsFolder: '_data/db-columns',
-  apiBaseName: 'ApiFields.base',
-  dbBaseName: 'DbColumns.base',
+  apiBaseName: 'ApiFields.base',  dbBaseName: 'DbColumns.base',
+  // 外部接口（6.client）：与内部接口同名时靠字段文件名的「外部接口-」前缀区分。
+  // 新建外部接口文档走 client 模板（章节与属性都与内部接口文档不同）。
+  clientDocsFolder: '6.client',
+  clientDocTemplate: '_template/业务模板/client-外部接口-waibu/client-外部接口-waibu.md',
   // 新建表文档时套用的模板；留空则回退到内置的最小结构
   dbDocTemplate: '_template/业务模板/db-数据库-shuju/db-数据库-shuju.md',
   // --- 字段表 → 表文档「## 建表语句」实时同步（自 v0.7.22 移植） ---
@@ -589,6 +592,69 @@ function normalizeDirection(value) {
   return '';
 }
 
+
+// --- 接口模块（内部 / 外部）与前缀约定（自 v0.7.19 / v0.7.20 分支移植）-----------
+// 本库 `5.api/` 与 `6.client/` 下存在**同名**接口（如两边的「助贷放款申请接口」），
+// 字段记录靠文件名的「内部接口- / 外部接口-」前缀区分，而接口文档名本身**不带**前缀。
+// 所以比较接口名、推导文档路径、生成字段文件名时都必须先归一化前缀，
+// 否则会把既有字段整批误判为新增，并写出 `[[5.api/内部接口-xxx]]` 这类不存在的链接。
+
+// 报文封套：标准内部接口报文形如 { head: {公共报文头}, body: {业务字段} }。
+// head 每个接口都一样 → 导入时应忽略；body 才是业务字段 → 全部导入，且字段路径不带 body. 前缀。
+// 规则：①「业务根节点」（默认 body）存在且是对象 → 只取该节点；
+//       ② 否则按「忽略的顶层节点」（默认 head）逐项丢弃，其余整体导入。
+// 两个选项都来自导入页，留空即完全不处理（导任意 JSON 的老用法行为不变）。
+const API_MODULE_PREFIX_RE = /^(?:内部接口|外部接口)[-_]/;
+function stripApiModulePrefix(name) {
+  return String(name == null ? '' : name).trim().replace(API_MODULE_PREFIX_RE, '').trim();
+}
+function sameApiName(a, b) {
+  const left = String(a == null ? '' : a).trim();
+  const right = String(b == null ? '' : b).trim();
+  return left === right || (!!left && stripApiModulePrefix(left) === stripApiModulePrefix(right));
+}
+// 模块前缀的取值固定为这两个（外加空＝不区分）。导入页的下拉只用这三个值，不要自定义。
+const API_MODULES = ['内部接口', '外部接口'];
+// 从文件名（可带目录）推断模块：`外部接口-xxx__Request__a.md` → 外部接口。
+// 只在文档路径判断不出来时兜底用（路径永远比文件名可靠）。
+function apiModuleFromFilename(pathOrName) {
+  const base = String(pathOrName == null ? '' : pathOrName).split('/').pop();
+  for (const m of API_MODULES) if (base.startsWith(m + '-') || base.startsWith(m + '_')) return m;
+  return '';
+}
+// 选了模块就把前缀统一加上（先剥旧前缀，避免出现「内部接口-外部接口-xxx」这种叠加）。
+// 不选模块时**保持用户输入的原文**，不擅自剥前缀——避免误伤名字里本来就带这些字的接口。
+function applyApiModulePrefix(apiName, module) {
+  const raw = String(apiName == null ? '' : apiName).trim();
+  if (!module) return raw;
+  const base = stripApiModulePrefix(raw) || raw;
+  return base ? `${module}-${base}` : '';
+}
+// 标准内部接口报文形如 { head: { 公共报文头 }, body: { 业务字段 } }：
+//   · head 每个接口都一样 → 导入时应忽略；
+//   · body 才是业务字段 → 全部导入，且**字段路径不带 body. 前缀**。
+// 规则：①「业务根节点」（默认 body）存在且是对象/数组 → 只取该节点（其余顶层节点一并丢弃，
+//       路径天然不带该节点名前缀）；② 否则按「忽略的顶层节点」（默认 head）逐项丢弃，其余整体导入。
+// 两个选项都来自导入页，留空即完全不处理（老用户导任意 JSON 时行为不变）。
+function splitNameList(value) {
+  return String(value == null ? '' : value).split(/[,，;；\s]+/).map((x) => x.trim()).filter(Boolean);
+}
+function selectImportPayload(data, options = {}) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return { data, root: '', dropped: [] };
+  const root = String(options.payloadRoot == null ? '' : options.payloadRoot).trim();
+  if (root && data[root] && typeof data[root] === 'object') {
+    return { data: data[root], root, dropped: Object.keys(data).filter((k) => k !== root) };
+  }
+  const ignore = splitNameList(options.ignoreTopKeys);
+  if (!ignore.length) return { data, root: '', dropped: [] };
+  const out = {};
+  const dropped = [];
+  for (const [k, v] of Object.entries(data)) {
+    if (ignore.includes(k)) { dropped.push(k); continue; }
+    out[k] = v;
+  }
+  return { data: out, root: '', dropped };
+}
 // --- XML 报文解析（自 v0.7.11 分支移植）----------------------------------------
 // 手写的一个小解析器：Obsidian 沙箱里没有 DOMParser，也不该为一个导入功能引入第三方依赖。
 // 只支持导入场景需要的子集：元素、属性、文本、CDATA、注释、处理指令、实体。
@@ -785,16 +851,32 @@ function extractJsonImportUnit(text, filename='', fallback={}) {
   }
   const originalData = data;
   const fromName = parseJsonFilenameTarget(filename);
-  const apiName = String(meta?.api || meta?.apiName || meta?.interface || fromName?.apiName || fallback.apiName || '').trim();
+  const rawApiName = String(meta?.api || meta?.apiName || meta?.interface || fromName?.apiName || fallback.apiName || '').trim();
+  // 模块前缀由导入页选择（不区分 / 内部接口 / 外部接口），决定字段文件名的前缀与新建文档的目录
+  const apiModule = String(fallback.apiModule || '').trim();
+  const apiName = applyApiModulePrefix(rawApiName, apiModule);
   const direction = normalizeDirection(meta?.direction || fromName?.direction || fallback.direction);
+  // ★ 报文封套（head / body）只是**内部接口文档**的标准报文格式：外部接口文档与 XML 不适用，
+  //   所以自动封套剥离只在「模块＝内部接口 且 非 XML」时生效。
+  const envelopeApplies = !isXml && apiModule === API_MODULES[0];
+  let payloadFromMeta = false;
   if (meta) {
+    // __schema 存在时的解包保持**无条件**（与历史行为一致）：收窄成"仅内部接口"会让
+    // 以前能用的导入突然失效，不冒这个险。封套只是它的补充，不替代它。
     const key = String(meta.dataKey || meta.payloadKey || '').trim();
-    if (key && Object.prototype.hasOwnProperty.call(data, key)) data = data[key];
-    else if (Object.prototype.hasOwnProperty.call(data, 'payload')) data = data.payload;
-    else if (Object.prototype.hasOwnProperty.call(data, 'body')) data = data.body;
-    else if (Object.prototype.hasOwnProperty.call(data, 'data')) data = data.data;
+    if (key && Object.prototype.hasOwnProperty.call(data, key)) { data = data[key]; payloadFromMeta = true; }
+    else if (Object.prototype.hasOwnProperty.call(data, 'payload')) { data = data.payload; payloadFromMeta = true; }
+    else if (Object.prototype.hasOwnProperty.call(data, 'body')) { data = data.body; payloadFromMeta = true; }
+    else if (Object.prototype.hasOwnProperty.call(data, 'data')) { data = data.data; payloadFromMeta = true; }
     // XML 的 __schema 是根下的一个元素，剥根时已经跳过，不必再过滤
     else if (!isXml) data = Object.fromEntries(Object.entries(data).filter(([k]) => k !== '__schema' && k !== '_schema'));
+  }
+  // 报文封套剥离：__schema 已经解包过就不再猜；否则按导入页的「业务根节点 / 忽略的顶层节点」
+  // 处理。两项都留空时完全 no-op（导任意 JSON 的老用法不受影响）。
+  let envelope = { root: '', dropped: [], applies: envelopeApplies };
+  if (!payloadFromMeta && envelopeApplies) {
+    envelope = Object.assign({ applies: true }, selectImportPayload(data, { payloadRoot: fallback.payloadRoot, ignoreTopKeys: fallback.ignoreTopKeys }));
+    data = envelope.data;
   }
   // 原始样例：只剥掉 __schema 元信息，其余原样保留 —— 示例给的是报文的真实形态
   let sample = '';
@@ -806,7 +888,7 @@ function extractJsonImportUnit(text, filename='', fallback={}) {
   }
   const sourceLabel = filename || (isXml ? 'XML 字符串' : 'JSON 字符串');
   if (!apiName || !direction) throw new Error(`无法确定导入目标：${sourceLabel}。请使用“接口名.Request.json / 接口名.Request.xml”，或在内容中提供 __schema.api + __schema.direction。`);
-  return { apiName, direction, data, filename: sourceLabel, sourceFormat: isXml ? 'xml' : 'json', sample };
+  return { apiName, direction, data, filename: sourceLabel, sourceFormat: isXml ? 'xml' : 'json', apiModule, envelope, sample };
 }
 function diffValue(v) {
   if (v === undefined) return '—';
@@ -1438,17 +1520,30 @@ class SchemaToolsPlugin extends Plugin {
       const apiPath = fmLinkPath(schemaValue(fm,'api','api'));
       const directionValue = schemaValue(fm,'api','direction');
       const apiName = basenameNoExt(apiPath);
+      // 模块判定：接口文档路径落在哪个目录最可靠；判定不出来再退回字段文件名前缀。
+      // 本库 5.api 与 6.client 下有同名接口，不区分就会把两边的字段混成一组。
+      const apiModule = this.apiModuleForPath(apiPath) || apiModuleFromFilename(file.path);
       const direction = normalizeDirection(directionValue) || directionValue || '';
       // 文件名格式「<接口名>__<方向>__<字段路径>」，字段名缺失时按同样规则剥掉前缀还原
       const fallbackName = memberNameFromFilename(memberNameFromFilename(file.path, apiName), direction);
       return {
-        file, filePath: file.path, apiPath, apiName,
+        file, filePath: file.path, apiPath, apiName, apiModule,
         direction, path: schemaValue(fm,'api','path') || '',
         parent_path: schemaValue(fm,'api','parent_path') || '', name: schemaValue(fm,'api','name') || fallbackName,
         shape: schemaValue(fm,'api','shape') || '', data_type: schemaValue(fm,'api','data_type') || '',
         schema_orphaned: this.isSchemaOrphaned(file.path), order: Number(schemaValue(fm,'api','order') || 0), fm,
       };
     }).filter(x => x.apiName && x.direction && x.path);
+  }
+  // 接口文档路径 → 模块。落在外部接口目录下就是外部接口，落在接口目录下就是内部接口，
+  // 其余（老数据 / 自定义目录）返回 '' 表示不区分。
+  apiModuleForPath(docPath) {
+    const p = normalizePath(String(docPath || ''));
+    if (!p) return '';
+    const inside = (folder) => { const f = normalizePath(String(folder || '')); return !!f && (p === f || p.startsWith(f + '/')); };
+    if (inside(this.settings.clientDocsFolder)) return API_MODULES[1];
+    if (inside(this.settings.apiDocsFolder)) return API_MODULES[0];
+    return '';
   }
   scanDbColumns() {
     const prefix = normalizePath(this.settings.dbColumnsFolder) + '/';
@@ -1722,7 +1817,7 @@ class SchemaToolsSettingTab extends PluginSettingTab {
     const { containerEl } = this; containerEl.empty();
     containerEl.createEl('h2', { text: 'Schema Tools' });
     const fields = [
-      ['apiDocsFolder','接口文档目录'],['dbDocsFolder','数据库文档目录'],
+      ['apiDocsFolder','接口文档目录'],['clientDocsFolder','外部接口文档目录'],['dbDocsFolder','数据库文档目录'],
       ['apiFieldsFolder','接口字段记录目录'],['dbColumnsFolder','数据库字段记录目录'],
     ];
     for (const [key, name] of fields) {
@@ -1735,6 +1830,12 @@ class SchemaToolsSettingTab extends PluginSettingTab {
       .setDesc('DDL 导入或手工新建数据库表时，套用这个模板生成表文档：表中文名取 DDL 的 COMMENT ON TABLE，数据库Schema、表名、建表语句自动填。留空则使用内置的最小结构。')
       .addText(t => t.setValue(this.plugin.settings.dbDocTemplate || '').onChange(async v => {
         this.plugin.settings.dbDocTemplate = v.trim(); await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl)
+      .setName('新建外部接口文档的模板')
+      .setDesc('导入页选「外部接口」模块时，新建的接口文档套用这个模板（章节与属性都与内部接口文档不同）。模板里的 {{:填写提示}} 会原样保留给用户填。留空则用内置简版。')
+      .addText(t => t.setValue(this.plugin.settings.clientDocTemplate || '').onChange(async v => {
+        this.plugin.settings.clientDocTemplate = v.trim(); await this.plugin.saveSettings();
       }));
     containerEl.createEl('h3', { text: '字段表 ⇄ 建表语句 同步' });
     new Setting(containerEl)
@@ -2906,7 +3007,9 @@ class SchemaStudioModal extends Modal {
     const draw=()=>{list.empty();const q=search.value.trim().toLowerCase();const items=this.domain==='api'?this.getApiGroups():this.domain==='db'?this.getDbGroups():this.getXxljobGroups();items.filter(x=>!q||x.label.toLowerCase().includes(q)).forEach(item=>{const row=list.createDiv({cls:`schema-studio-nav-item${this.selectedKey===item.key&&this.page==='browse'?' is-active':''}`});row.createDiv({text:item.label,cls:'schema-studio-nav-title'});row.createDiv({text:item.detail,cls:'schema-tools-muted'});row.onclick=()=>{this.selectedKey=item.key;this.page='browse';this.render();};});if(!items.length)list.createDiv({text:'暂无数据',cls:'schema-tools-muted schema-studio-empty'});};search.oninput=draw;draw();
   }
   domainButton(parent,domain,label){const btn=parent.createEl('button',{text:label,cls:this.domain===domain?'is-active':''});btn.onclick=()=>{this.domain=domain;this.selectedKey=null;this.page='browse';this.importState=null;this.render();};}
-  getApiGroups(){const map=new Map();for(const r of this.plugin.scanApiFields()){if(!map.has(r.apiName))map.set(r.apiName,{key:r.apiName,label:r.apiName,rows:[],apiPath:r.apiPath});map.get(r.apiName).rows.push(r);}return [...map.values()].sort((a,b)=>a.label.localeCompare(b.label,'zh-CN')).map(x=>({...x,detail:`${x.rows.filter(r=>!r.schema_orphaned).length} 个节点`}));}
+  // 按「模块 + 接口名」分组：5.api 与 6.client 下的同名接口是两回事，不能合成一组，
+  // 否则两边的字段会混在一起、编辑时互相覆盖。
+  getApiGroups(){const map=new Map();for(const r of this.plugin.scanApiFields()){const label=`${r.apiModule?r.apiModule+'-':''}${r.apiName}`;if(!map.has(label))map.set(label,{key:label,label,apiModule:r.apiModule||'',apiName:r.apiName,rows:[],apiPath:r.apiPath});map.get(label).rows.push(r);}return [...map.values()].sort((a,b)=>a.label.localeCompare(b.label,'zh-CN')).map(x=>({...x,detail:`${x.rows.filter(r=>!r.schema_orphaned).length} 个节点`}));}
   getDbGroups(){const map=new Map();for(const r of this.plugin.scanDbColumns()){if(!map.has(r.table))map.set(r.table,{key:r.table,label:r.table,rows:[],tablePath:r.tablePath});map.get(r.table).rows.push(r);}return [...map.values()].sort((a,b)=>a.label.localeCompare(b.label)).map(x=>({...x,detail:`${x.rows.filter(r=>!r.schema_orphaned).length} 列`}));}
   renderBrowse(){this.domain==='api'?this.renderApiBrowse():this.domain==='db'?this.renderDbBrowse():this.renderXxljobBrowse();}
   // --- xxl-job 域：按执行器分组，列出 <执行器>/{任务流,任务,任务组件} 下的文档 ---
@@ -3428,7 +3531,7 @@ class SchemaStudioModal extends Modal {
   renderApiBrowse(){
     const groups=this.getApiGroups();if(!this.selectedKey&&groups.length)this.selectedKey=groups[0].key;const group=groups.find(x=>x.key===this.selectedKey);if(!group)return this.renderWelcome('接口 Schema','从左侧批量导入 JSON，或选择已有接口查看和编辑字段。');
     const rows=group.rows.filter(r=>!r.schema_orphaned).sort((a,b)=>a.direction.localeCompare(b.direction)||(a.order-b.order)||a.path.localeCompare(b.path));
-    this.renderHeader(group.label,group.apiPath||'接口文档',[{text:'保存编辑',onclick:()=>this.saveDynamicEdits(rows)},{text:'JSON 导入 / 更新',primary:true,onclick:()=>{this.page='json-import';this.importState={apiName:group.label,direction:'Request',jsonText:'',jsonFiles:[]};this.render();}}]);
+    this.renderHeader(group.label,group.apiPath||'接口文档',[{text:'保存编辑',onclick:()=>this.saveDynamicEdits(rows)},{text:'JSON 导入 / 更新',primary:true,onclick:()=>{this.page='json-import';this.importState={apiName:group.apiName,apiModule:group.apiModule,direction:'Request',jsonText:'',jsonFiles:[]};this.render();}}]);
     this.mainEl.createDiv({text:'字段列来自 Fileclass 定义；以后在 ApiField Fileclass 中增删属性，Schema Studio 会自动同步。路径/归属等标识字段只读，其他属性可直接编辑。',cls:'schema-tools-callout'});this.renderGenericEditor(rows,'api');
     const orphan=group.rows.filter(r=>r.schema_orphaned);if(orphan.length)this.mainEl.createDiv({text:`另有 ${orphan.length} 个“疑似删除”节点。`,cls:'schema-tools-muted schema-studio-footnote'});
   }
@@ -3586,24 +3689,28 @@ class SchemaStudioModal extends Modal {
   }
 
   renderJsonImport(){
-    const state=this.importState||{apiName:'',direction:'Request',jsonText:'',jsonFiles:[],xmlInferTypes:false};this.importState=state;this.renderPageHeader('JSON / XML → 接口 Schema','支持 JSON 与 XML 字符串、单文件和批量文件；批量文件按文件名或 __schema 元信息自动路由。');
+    const state=this.importState||{apiName:'',direction:'Request',jsonText:'',jsonFiles:[],xmlInferTypes:false,apiModule:'',payloadRoot:'',ignoreTopKeys:''};this.importState=state;this.renderPageHeader('JSON / XML → 接口 Schema','支持 JSON 与 XML 字符串、单文件和批量文件；批量文件按文件名或 __schema 元信息自动路由。');
     this.mainEl.createDiv({text:'批量命名示例：创建订单.Request.json、创建订单-Response.xml。也可以在内容中加入 __schema: { api, direction }（XML 用 <__schema api="创建订单" direction="Request"/> 元素），payload/body/data 作为实际样例。XML 解析：剥离根元素（根只作报文容器）；属性写成 @属性名（如 @id）；同名重复元素自动识别为数组；元素既有属性又有文本时文本记为 _text（不用 #text，避免与 Obsidian 链接锚点冲突）；命名空间前缀保留原样。导入的原始报文会逐字节写进接口文档的「## 请求示例 / ## 响应示例」代码块（文档里没有该章节则不写）。导入器只覆盖可推断的结构属性，Fileclass 中的其他自定义属性会保留。',cls:'schema-tools-callout'});
     this.renderMultiFileChooser('json',state,'jsonFiles');
-    const form=this.mainEl.createDiv({cls:'schema-studio-form'});new Setting(form).setName('JSON 字符串的接口名称').setDesc('仅用于下方粘贴的 JSON，或单个无法从文件名识别的文件。').addText(t=>t.setValue(state.apiName||'').onChange(v=>state.apiName=v.trim()));new Setting(form).setName('方向').addDropdown(d=>d.addOptions({Request:'Request',Response:'Response'}).setValue(state.direction||'Request').onChange(v=>state.direction=v));new Setting(form).setName('XML 类型推断').setDesc('默认关闭：XML 里一切都是字符串。打开后 <age>18</age> 会读成数字、<flag>true</flag> 读成布尔 —— 但「0001」这类有前导零的编码会被吞掉前导零，按需开启。').addToggle(t=>t.setValue(!!state.xmlInferTypes).onChange(v=>state.xmlInferTypes=v));
+    const form=this.mainEl.createDiv({cls:'schema-studio-form'});new Setting(form).setName('JSON 字符串的接口名称').setDesc('仅用于下方粘贴的 JSON，或单个无法从文件名识别的文件。').addText(t=>t.setValue(state.apiName||'').onChange(v=>state.apiName=v.trim()));new Setting(form).setName('方向').addDropdown(d=>d.addOptions({Request:'Request',Response:'Response'}).setValue(state.direction||'Request').onChange(v=>state.direction=v));new Setting(form).setName('接口模块').setDesc('决定字段记录的文件名前缀与新建接口文档的目录。本库 5.api 与 6.client 下有同名接口，靠这个区分；选「外部接口」时文档落 6.client 并套 client 模板。').addDropdown(d=>d.addOption('','不区分').addOption(API_MODULES[0],API_MODULES[0]).addOption(API_MODULES[1],API_MODULES[1]).setValue(state.apiModule||'').onChange(v=>{state.apiModule=v;if(v===API_MODULES[0]){if(!state.payloadRoot)state.payloadRoot='body';if(!state.ignoreTopKeys)state.ignoreTopKeys='head';}this.render();}));new Setting(form).setName('业务根节点').setDesc('仅「模块＝内部接口」且内容是 JSON 时生效。内部接口报文形如 { head, body }，填 body 则只取 body 里的字段、路径不带 body. 前缀。留空不处理。').addText(t=>t.setValue(state.payloadRoot||'').onChange(v=>state.payloadRoot=v.trim()));new Setting(form).setName('忽略的顶层节点').setDesc('同上生效条件。没有命中「业务根节点」时，按这里逐项丢弃顶层节点（默认丢弃公共报文头 head），其余整体导入。多个用逗号分隔，留空不处理。').addText(t=>t.setValue(state.ignoreTopKeys||'').onChange(v=>state.ignoreTopKeys=v.trim()));new Setting(form).setName('XML 类型推断').setDesc('默认关闭：XML 里一切都是字符串。打开后 <age>18</age> 会读成数字、<flag>true</flag> 读成布尔 —— 但「0001」这类有前导零的编码会被吞掉前导零，按需开启。').addToggle(t=>t.setValue(!!state.xmlInferTypes).onChange(v=>state.xmlInferTypes=v));
     this.mainEl.createDiv({text:'JSON 字符串（可选）',cls:'schema-tools-label'});const ta=this.mainEl.createEl('textarea',{cls:'schema-tools-textarea',attr:{placeholder:'{\n  "mobile": "13800000000"\n}'}});ta.value=state.jsonText||'';ta.oninput=()=>state.jsonText=ta.value;
     const actions=this.mainEl.createDiv({cls:'schema-tools-actions'});const analyze=actions.createEl('button',{text:'分析全部并查看 Diff',cls:'mod-cta'});analyze.onclick=()=>this.analyzeJson(state);
   }
   buildApiAnalysis(unit){
-    const inferred=core.flattenJsonSample(unit.data);const existing=this.plugin.scanApiFields().filter(x=>x.apiName===unit.apiName&&x.direction===unit.direction);const exMap=new Map(existing.map(x=>[x.path,x]));const defaults=this.plugin.defaultPropertiesForDomain('api');
+    // 匹配既有字段：接口名按「剥掉模块前缀」归一化比较（本库 5.api 与 6.client 下有同名接口，
+    // 直接比字符串会把另一边整个当成新增）。选了模块就只在同模块内匹配；没选模块则不限，
+    // 老用法（不带前缀的历史数据）不受影响。
+    const inferred=core.flattenJsonSample(unit.data);const existing=this.plugin.scanApiFields().filter(x=>x.direction===unit.direction&&sameApiName(x.apiName,unit.apiName)&&(!unit.apiModule||!x.apiModule||x.apiModule===unit.apiModule));
+    const exMap=new Map(existing.map(x=>[x.path,x]));const defaults=this.plugin.defaultPropertiesForDomain('api');
     const incoming=inferred.map(struct=>{const old=exMap.get(struct.path);const base=old?stripCacheKeys(old.fm):Object.assign({},defaults);for(const [key,value] of Object.entries(Object.assign({},struct,{direction:unit.direction})))setSchemaValue(base,'api',key,value);base.key=struct.path;return base;});
     const existingCanonical=existing.map(x=>Object.assign({key:x.path},canonicalSchemaRecord('api',x.fm)));
     const incomingCanonical=incoming.map(x=>Object.assign({key:x.key},canonicalSchemaRecord('api',x)));
-    const diff=core.diffRecords(existingCanonical,incomingCanonical,API_IMPORT_MANAGED_KEYS);return {apiName:unit.apiName,direction:unit.direction,sourceName:unit.filename,sourceFormat:unit.sourceFormat||'json',sample:unit.sample||'',incoming,existing,diff};
+    const diff=core.diffRecords(existingCanonical,incomingCanonical,API_IMPORT_MANAGED_KEYS);return {apiName:unit.apiName,apiModule:unit.apiModule||'',direction:unit.direction,sourceName:unit.filename,sourceFormat:unit.sourceFormat||'json',sample:unit.sample||'',envelope:unit.envelope||null,incoming,existing,diff};
   }
   analyzeJson(state){
-    const fb={apiName:state.apiName,direction:state.direction,xmlInferTypes:!!state.xmlInferTypes};
-    const units=[];const files=state.jsonFiles||[];try{for(const f of files)units.push(extractJsonImportUnit(f.text,f.name,files.length===1?fb:{xmlInferTypes:!!state.xmlInferTypes}));if((state.jsonText||'').trim())units.push(extractJsonImportUnit(state.jsonText,'',fb));}catch(e){new Notice(`导入映射失败：${e.message}`);return;}if(!units.length){new Notice('请选择文件或粘贴 JSON / XML 字符串');return;}
-    const seen=new Set();for(const u of units){const k=`${u.apiName}\u0000${u.direction}`;if(seen.has(k)){new Notice(`批量导入中目标重复：${u.apiName} / ${u.direction}`);return;}seen.add(k);}
+    const fb={apiName:state.apiName,direction:state.direction,xmlInferTypes:!!state.xmlInferTypes,apiModule:state.apiModule||'',payloadRoot:state.payloadRoot||'',ignoreTopKeys:state.ignoreTopKeys||''};
+    const units=[];const files=state.jsonFiles||[];try{for(const f of files)units.push(extractJsonImportUnit(f.text,f.name,files.length===1?fb:{xmlInferTypes:!!state.xmlInferTypes,apiModule:state.apiModule||'',payloadRoot:state.payloadRoot||'',ignoreTopKeys:state.ignoreTopKeys||''}));if((state.jsonText||'').trim())units.push(extractJsonImportUnit(state.jsonText,'',fb));}catch(e){new Notice(`导入映射失败：${e.message}`);return;}if(!units.length){new Notice('请选择文件或粘贴 JSON / XML 字符串');return;}
+    const seen=new Set();for(const u of units){const k=`${u.apiModule}\u0000${u.apiName}\u0000${u.direction}`;if(seen.has(k)){new Notice(`批量导入中目标重复：${u.apiModule?u.apiModule+'-':''}${u.apiName} / ${u.direction}`);return;}seen.add(k);}
     state.analysis=units.map(u=>this.buildApiAnalysis(u));this.page='json-diff';this.render();
   }
   renderDiffDetails(diff){
@@ -3618,7 +3725,8 @@ class SchemaStudioModal extends Modal {
     const {defs}=this.getGridDefinitions('api',API_IMPORT_MANAGED_KEYS);
     for(const a of analyses){
       const counts=countStatuses(a.diff);
-      this.mainEl.createEl('h3',{text:`${a.apiName} / ${a.direction} · ${a.sourceName}`});
+      this.mainEl.createEl('h3',{text:`${a.apiModule?a.apiModule+'-':''}${stripApiModulePrefix(a.apiName)} / ${a.direction} · ${a.sourceName}`});
+      if(a.envelope&&a.envelope.applies&&(a.envelope.root||(a.envelope.dropped||[]).length))this.mainEl.createDiv({text:a.envelope.root?`报文封套：只取顶层「${a.envelope.root}」节点${(a.envelope.dropped||[]).length?`，已丢弃 ${a.envelope.dropped.join('、')}`:''}（字段路径不带该节点名前缀）`:`报文封套：已丢弃顶层 ${a.envelope.dropped.join('、')}`,cls:'schema-tools-muted schema-studio-footnote'});
       this.mainEl.createDiv({text:`新增 ${counts.added} · 属性变化 ${counts.changed} · 未变化 ${counts.unchanged} · 源中消失 ${counts.removed}`,cls:'schema-tools-summary'});
       const byDiff=new Map(a.diff.map(d=>[d.key,d])),byIncoming=new Map(a.incoming.map(r=>[r.key,r]));
       const keys=[...a.incoming.map(r=>r.key),...a.diff.filter(d=>d.status==='removed').map(d=>d.key)];
@@ -3659,7 +3767,7 @@ class SchemaStudioModal extends Modal {
     const apiDocPath=this.resolveApiDocPath(a);
     await ensureFolder(this.app,apiDocPath.split('/').slice(0,-1).join('/'));
     const apiLink=`[[${apiDocPath.replace(/\.md$/,'')}]]`;
-    if(!this.app.vault.getAbstractFileByPath(apiDocPath))await this.app.vault.create(apiDocPath,`# ${a.apiName}\n\n## Request\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Request]]\n\n## Response\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Response]]\n`);
+    if(!this.app.vault.getAbstractFileByPath(apiDocPath))await this.app.vault.create(apiDocPath,await this.renderNewApiDoc(a));
     // 导入的原始报文写进「## 请求示例 / ## 响应示例」（文档里没这个章节就不写，不去凭空插章节）
     const sampleHeading=a.direction==='Response'?'响应示例':'请求示例';
     const sampleLang=a.sourceFormat==='xml'?'xml':'json';
@@ -3685,19 +3793,22 @@ class SchemaStudioModal extends Modal {
 
   // 解析「本批要写入哪个表/接口文档」：优先沿用现有字段记录已指向、且确实存在的位置，
   // 避免按设置里的扁平目录改写链接（多 Schema 分子目录的知识库里那会造成断链）。
-  resolveDocPathFromRows(rows, domain, name, schema) {
+  resolveDocPathFromRows(rows, domain, name, schema, apiModule) {
     const linkKey = domain === 'api' ? 'api' : 'table';
     for (const row of rows) {
       const link = schemaValue(row.fm, domain, linkKey);
       const target = fmLinkPath(link);
       if (target && this.app.vault.getAbstractFileByPath(`${target}.md`)) return `${target}.md`;
     }
-    const folder = domain === 'api' ? this.plugin.settings.apiDocsFolder : this.plugin.settings.dbDocsFolder;
+    // 新建时才按设置目录落位：外部接口落 clientDocsFolder，其余落 apiDocsFolder
+    const folder = domain === 'api'
+      ? (apiModule === API_MODULES[1] ? this.plugin.settings.clientDocsFolder : this.plugin.settings.apiDocsFolder)
+      : this.plugin.settings.dbDocsFolder;
     // 全新的表：DDL 里带 schema 时落到同名子目录（如 CAPITAL → 7.db/capital/），与多 Schema 目录结构一致
     const sub = domain === 'db' && String(schema || '').trim()
       ? normalizePath(`${folder}/${String(schema).trim().toLowerCase()}`)
       : normalizePath(folder);
-    return normalizePath(`${sub}/${name}.md`);
+    return normalizePath(`${sub}/${stripApiModulePrefix(name)}.md`);
   }
 
   // 新建表文档：按模板生成（表中文名取 DDL 的表注释，数据库Schema / 表名自动填，建表语句放 DDL 原文）
@@ -3722,7 +3833,27 @@ class SchemaStudioModal extends Modal {
     const body = fillTemplatePlaceholders(stripFrontmatterBlock(raw), ddlText);
     return `---\n${stringifyYaml(fm)}---\n\n${body.replace(/^\n+/, '')}`;
   }
-  resolveApiDocPath(a) { return this.resolveDocPathFromRows(a.existing, 'api', a.apiName); }
+  resolveApiDocPath(a) { return this.resolveDocPathFromRows(a.existing, 'api', a.apiName, null, a.apiModule); }
+  // 新建接口文档：外部接口套 client 模板（章节与属性都与内部接口文档不同），内部接口维持既有最小结构。
+  // 模板缺失或读取失败时回退到内置简版，不让一次模板问题中断整批导入。
+  async renderNewApiDoc(a) {
+    const title = stripApiModulePrefix(a.apiName) || a.apiName;
+    const base = this.plugin.settings.apiBaseName;
+    const fence = '```';
+    const external = `# ${title}\n\n# 请求字段说明\n\n![[${base}#当前接口请求字段]]\n\n## 请求示例\n\n${fence}json\n{}\n${fence}\n\n# 响应字段说明\n\n![[${base}#当前接口响应字段]]\n\n## 响应示例\n\n${fence}json\n{}\n${fence}\n`;
+    if (a.apiModule !== API_MODULES[1]) return `# ${title}\n\n## Request\n\n![[${base}#当前接口 Request]]\n\n## Response\n\n![[${base}#当前接口 Response]]\n`;
+    const tplPath = normalizePath(String(this.plugin.settings.clientDocTemplate || '').replace(/\.md$/i, ''));
+    if (!tplPath) return external;
+    const file = this.app.vault.getAbstractFileByPath(`${tplPath}.md`);
+    if (!file) return external;
+    let raw = '';
+    try { raw = await this.app.vault.read(file); } catch (e) { return external; }
+    const fm = Object.assign({}, this.app.metadataCache.getFileCache(file)?.frontmatter || {});
+    for (const key of Object.keys(fm)) if (FRONTMATTER_INTERNAL_KEYS.has(key)) delete fm[key];
+    // body 里的 {{:填写提示}} 原样保留 —— 那是给用户的待填提醒，不该被清掉
+    const body = fillTemplatePlaceholders(stripFrontmatterBlock(raw), '').replace(/^\n+/, '');
+    return Object.keys(fm).length ? `---\n${stringifyYaml(fm)}---\n\n${body}` : body;
+  }
   resolveDbDocPath(a) { return this.resolveDocPathFromRows(a.existing, 'db', a.table, a.schema); }
 
   renderDdlImport(){
@@ -3901,5 +4032,5 @@ function countStatuses(diff){const c={added:0,changed:0,unchanged:0,removed:0};f
 function labelStatus(s){return {added:'新增',changed:'变化',unchanged:'未变',removed:'消失'}[s]||s;}
 function changeSummary(d){if(!d||d.status!=='changed')return '';return '变更：'+d.changes.map(k=>`${k} ${JSON.stringify(d.before?.[k]??'')} → ${JSON.stringify(d.after?.[k]??'')}`).join('；');}
 
-SchemaToolsPlugin._test = { core, DDL_DIALECTS, DEFAULTS, xxlLoaded: () => !!xxl, xxlBoot: bootXxl, xxlAbsDir: xxlAbsolutePluginDir, xxlLog: () => xxlLoadLog, XXL_DIRS, XXL_CLASS_BY_LEVEL, XXL_STATE_FILENAME, xxlSettings, xxlStatePathFor, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell, decodeXmlEntities, parseXmlToTree, parseXmlPayload, xmlNodeToValue, normalizeXmlScalar, looksLikeXmlText, escapeRe, upsertSectionCodeBlock, readSectionCodeBlock, detectDdlDialect, splitTopLevelRanges, scanCreateTable, renderColumnDef, buildDdlFromColumns };
+SchemaToolsPlugin._test = { core, DDL_DIALECTS, DEFAULTS, xxlLoaded: () => !!xxl, xxlBoot: bootXxl, xxlAbsDir: xxlAbsolutePluginDir, xxlLog: () => xxlLoadLog, XXL_DIRS, XXL_CLASS_BY_LEVEL, XXL_STATE_FILENAME, xxlSettings, xxlStatePathFor, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell, API_MODULES, stripApiModulePrefix, applyApiModulePrefix, sameApiName, apiModuleFromFilename, splitNameList, selectImportPayload, decodeXmlEntities, parseXmlToTree, parseXmlPayload, xmlNodeToValue, normalizeXmlScalar, looksLikeXmlText, escapeRe, upsertSectionCodeBlock, readSectionCodeBlock, detectDdlDialect, splitTopLevelRanges, scanCreateTable, renderColumnDef, buildDdlFromColumns };
 module.exports = SchemaToolsPlugin;
