@@ -298,13 +298,42 @@ function noteBodyApiField(apiName, direction, row) {
   return `# ${apiName}.${direction}.${row.path}\n\n${row.description || '待补充说明。'}\n\n所属接口：[[${apiName}]]\n方向：\`${direction}\`\n路径：\`${row.path}\`\n结构：\`${row.shape}\` / \`${row.data_type}\`${parent}\n`;
 }
 function noteBodyDbColumn(table, row) {
-  return `# ${table}.${row.name}\n\n${row.description || row.ddl_comment || '待补充说明。'}\n\n所属表：[[${table}]]\n`;
+  return `# ${table}.${row.name}\n\n${row.description || '待补充说明。'}\n\n所属表：[[${table}]]\n`;
 }
 
 
 const FRONTMATTER_INTERNAL_KEYS = new Set(['position']);
-const API_IMPORT_MANAGED_KEYS = ['direction','path','parent_path','name','shape','data_type','order'];
-const DB_IMPORT_MANAGED_KEYS = ['name','data_type','nullable','primary_key','indexed','default_value','references','ddl_comment','order'];
+
+// 工具运行态键：不再写入业务文档 frontmatter，改由中心化状态文件承载。
+// 载体：`<字段记录目录的上级>/.schema-state.json`（默认 `_data/.schema-state.json`，可随 git 追踪）。
+const SCHEMA_STATE_KEY_NAMES = new Set([
+  'schema_source','schema_dialect','schema_orphaned','last_imported_at',
+  '来源方式','方言','疑似删除','最后导入时间',
+]);
+// 已废弃的真实结构键与旧注释键：知识库侧已从 Fileclass 定义移除，导入时不再写入并顺带清理。
+// 注意 `注释` 不在此列——它是通用中文词，可能被别的知识库当作人工属性用，只读不删。
+const SCHEMA_DEPRECATED_KEY_NAMES = new Set(['references','引用','order','顺序','ddl_comment','DDL注释']);
+// 统一的内部键名单（P2）：界面过滤、字段定义推断、写入前清理都只认这一份。
+const SCHEMA_INTERNAL_KEYS = new Set([...FRONTMATTER_INTERNAL_KEYS, ...SCHEMA_STATE_KEY_NAMES, ...SCHEMA_DEPRECATED_KEY_NAMES]);
+const SCHEMA_STATE_FILENAME = '.schema-state.json';
+
+function schemaStatePathFor(dbColumnsFolder) {
+  const folder = normalizePath(dbColumnsFolder || '');
+  const cut = folder.lastIndexOf('/');
+  const dir = cut < 0 ? '' : folder.slice(0, cut);
+  return normalizePath(dir ? `${dir}/${SCHEMA_STATE_FILENAME}` : SCHEMA_STATE_FILENAME);
+}
+
+// 写入前清理：内部键不得落进 frontmatter（P0 / P1）。
+function purgeSchemaInternalKeys(record) {
+  if (!record) return record;
+  for (const key of Object.keys(record)) if (SCHEMA_INTERNAL_KEYS.has(key)) delete record[key];
+  return record;
+}
+
+const API_IMPORT_MANAGED_KEYS = ['direction','path','parent_path','name','shape','data_type'];
+// `ddl_comment` 已并入 `说明`（P4），`references` / `order` 已废弃 → 三者都不再参与写入与 Diff。
+const DB_IMPORT_MANAGED_KEYS = ['name','data_type','nullable','primary_key','indexed','default_value','description'];
 const SCHEMA_KEY_ALIASES = {
   api: {
     api: ['api','接口名称'], direction: ['direction','请求/响应'], path: ['path','字段路径'],
@@ -323,8 +352,8 @@ const SCHEMA_KEY_ALIASES = {
 };
 const NON_EDITABLE_IDENTITY_KEYS = new Set([
   'api','接口名称','table','数据表','数据表名称','direction','请求/响应','path','字段路径','parent_path','父级路径',
-  'name','字段','列名','字段名','order','顺序','schema_orphaned','疑似删除','schema_source','来源方式',
-  'schema_dialect','方言','last_imported_at','最后导入时间',
+  'name','字段','列名','字段名',
+  ...SCHEMA_INTERNAL_KEYS,
 ]);
 
 function normalizeFieldDefinition(raw) {
@@ -377,6 +406,14 @@ function canonicalSchemaRecord(domain, fm) {
     if (value !== undefined) out[key] = domain === 'api' && key === 'direction' ? normalizeDirection(value) || value : value;
   }
   return out;
+}
+// 表格读值：先按属性名直取（中文键知识库就是这种情形），取不到再按别名解析，
+// 保证「旧值（规范记录）」和「新值（frontmatter 形态记录）」读同一套语义，不产生假差异。
+function readSchemaCell(record, domain, key) {
+  if (!record) return undefined;
+  if (Object.prototype.hasOwnProperty.call(record, key)) return record[key];
+  const value = schemaValue(record, domain, key);
+  return value === undefined ? '' : value;
 }
 function normalizeDirection(value) {
   const s = String(value || '').trim().toLowerCase();
@@ -610,9 +647,6 @@ function buildDemoFilePlan(root = DEMO_ROOT) {
           high_risk: highRisk,
           description: demoDescription(row.path),
           db_column: demoDbMapping(p, row.path),
-          reviewed: true,
-          order: row.order,
-          schema_orphaned: false,
         };
         const fp = `${p.apiFields}/${core.makeApiFieldFilename(apiName,direction,row.path)}.md`;
         add(fp, `---\n${stringifyYaml(props)}---\n\n${noteBodyApiField(apiName,direction,props)}`);
@@ -643,8 +677,7 @@ function buildDemoFilePlan(root = DEMO_ROOT) {
     add(tableDocPath, `# ${tableTitle}\n\n这是 Schema Tools 中文体验样例中的数据库表。\n\n## 字段\n\n![[${p.dbBase}#当前数据表]]\n`);
     cols.forEach((c, i) => {
       const [name,data_type,nullable,primary_key,indexed,high_risk,description,references] = c;
-      const props = { fileClass:'体验数据库字段', table:`[[${tableDocPath.replace(/\.md$/,'')}]]`, name, data_type, nullable, primary_key, indexed, high_risk, description, order:(i+1)*10, schema_orphaned:false };
-      if (references) props.references = references;
+      const props = { fileClass:'体验数据库字段', table:`[[${tableDocPath.replace(/\.md$/,'')}]]`, name, data_type, nullable, primary_key, indexed, high_risk, description };
       const fp = `${p.dbColumns}/${core.makeDbColumnFilename(table,name)}.md`;
       add(fp, `---\n${stringifyYaml(props)}---\n\n${noteBodyDbColumn(table,props)}`);
     });
@@ -743,6 +776,11 @@ class DemoRestoreModal extends Modal {
 class SchemaToolsPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
+    this.schemaState = { version: 1, updatedAt: '', records: {} };
+    await this.loadSchemaState();
+    this.registerEvent(this.app.vault.on('modify', (file) => {
+      if (file && normalizePath(file.path) === this.schemaStatePath()) this.loadSchemaState().catch(() => {});
+    }));
     this.addSettingTab(new SchemaToolsSettingTab(this.app, this));
 
     // Register our suggester normally, then move only this suggester ahead of the
@@ -781,6 +819,48 @@ class SchemaToolsPlugin extends Plugin {
     });
   }
   async saveSettings() { await this.saveData(this.settings); }
+
+  // --- 中心化状态载体（P0 / P1）------------------------------------------------
+  // 运行态（来源方式 / 方言 / 疑似删除 / 最后导入时间）不再寄生在业务文档上，
+  // 统一放在字段记录目录同级的 `.schema-state.json`；`疑似删除` 也从这里读。
+  schemaStatePath() { return schemaStatePathFor(this.settings.dbColumnsFolder); }
+  schemaStateFor(filePath) { return this.schemaState?.records?.[normalizePath(filePath)] || null; }
+  isSchemaOrphaned(filePath) { return !!this.schemaStateFor(filePath)?.orphaned; }
+  async loadSchemaState() {
+    this.schemaState = { version: 1, updatedAt: '', records: {} };
+    try {
+      const path = this.schemaStatePath();
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!file) return this.schemaState;
+      const parsed = JSON.parse(await this.app.vault.read(file));
+      if (parsed && typeof parsed === 'object') {
+        this.schemaState = {
+          version: parsed.version || 1,
+          updatedAt: parsed.updatedAt || '',
+          records: parsed.records && typeof parsed.records === 'object' ? parsed.records : {},
+        };
+      }
+    } catch (e) { console.warn('[Schema Studio] 读取状态文件失败，按空状态继续', e); }
+    return this.schemaState;
+  }
+  async patchSchemaState(patch) {
+    if (!patch || !Object.keys(patch).length) return;
+    const state = await this.loadSchemaState();
+    for (const [filePath, value] of Object.entries(patch)) {
+      const key = normalizePath(filePath);
+      state.records[key] = Object.assign({}, state.records[key] || {}, value);
+    }
+    state.updatedAt = new Date().toISOString();
+    const path = this.schemaStatePath();
+    try {
+      await ensureFolder(this.app, path.split('/').slice(0, -1).join('/'));
+      const body = JSON.stringify(state, null, 2) + '\n';
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (file) await this.app.vault.modify(file, body);
+      else await this.app.vault.create(path, body);
+      this.schemaState = state;
+    } catch (e) { console.warn('[Schema Studio] 写入状态文件失败', e); }
+  }
 
   async createDemoFiles(plan) {
     for (const item of plan.files) {
@@ -893,7 +973,7 @@ class SchemaToolsPlugin extends Plugin {
     const defs = new Map((cls?.fields || []).map(d => [d.name, d]));
     const rows = domain === 'api' ? this.scanApiFields() : this.scanDbColumns();
     for (const row of rows) for (const key of Object.keys(row.fm || {})) {
-      if (FRONTMATTER_INTERNAL_KEYS.has(key) || key === 'fileClass' || ['schema_source','schema_dialect','schema_orphaned','last_imported_at'].includes(key)) continue;
+      if (FRONTMATTER_INTERNAL_KEYS.has(key) || key === 'fileClass' || SCHEMA_INTERNAL_KEYS.has(key)) continue;
       if (!defs.has(key)) defs.set(key, { name:key, type:typeof row.fm[key] === 'boolean' ? 'Boolean' : typeof row.fm[key] === 'number' ? 'Number' : 'Input', required:false, options:[] });
     }
     return { className: cls?.className || (domain === 'api' ? 'ApiField' : 'DbColumn'), fields:[...defs.values()] };
@@ -917,7 +997,7 @@ class SchemaToolsPlugin extends Plugin {
         direction: normalizeDirection(directionValue) || directionValue || '', path: schemaValue(fm,'api','path') || '',
         parent_path: schemaValue(fm,'api','parent_path') || '', name: schemaValue(fm,'api','name') || basenameNoExt(file.path),
         shape: schemaValue(fm,'api','shape') || '', data_type: schemaValue(fm,'api','data_type') || '',
-        schema_orphaned: bool(schemaValue(fm,'api','schema_orphaned')), order: Number(schemaValue(fm,'api','order') || 0), fm,
+        schema_orphaned: this.isSchemaOrphaned(file.path), order: Number(schemaValue(fm,'api','order') || 0), fm,
       };
     }).filter(x => x.apiName && x.direction && x.path);
   }
@@ -930,7 +1010,7 @@ class SchemaToolsPlugin extends Plugin {
         file, filePath: file.path, tablePath, table: basenameNoExt(tablePath),
         name: schemaValue(fm,'db','name') || basenameNoExt(file.path), data_type: schemaValue(fm,'db','data_type') || '',
         nullable: bool(schemaValue(fm,'db','nullable'), true), primary_key: bool(schemaValue(fm,'db','primary_key')),
-        indexed: bool(schemaValue(fm,'db','indexed')), schema_orphaned: bool(schemaValue(fm,'db','schema_orphaned')),
+        indexed: bool(schemaValue(fm,'db','indexed')), schema_orphaned: this.isSchemaOrphaned(file.path),
         default_value: schemaValue(fm,'db','default_value') ?? '', references: schemaValue(fm,'db','references') || '',
         ddl_comment: schemaValue(fm,'db','ddl_comment') || '', order: Number(schemaValue(fm,'db','order') || 0), fm,
       };
@@ -1626,10 +1706,11 @@ class SchemaStudioModal extends Modal {
   }
   getGridDefinitions(domain,extraKeys=[]){
     const schema=this.plugin.getFieldDefinitions(domain);
-    const hidden=new Set(['api','table','schema_orphaned','schema_source','schema_dialect','last_imported_at']);
+    const hidden=new Set(['api','table',...SCHEMA_INTERNAL_KEYS]);
     const defs=schema.fields.filter(d=>!hidden.has(d.name));
     const by=new Map(defs.map(d=>[d.name,d]));
-    for(const key of extraKeys||[])if(key&&!hidden.has(key)&&!by.has(key)){
+    // extraKeys 只在 Fileclass 里没有对应属性（含中文别名）时才补列，避免同一属性出现中英文两列
+    for(const key of extraKeys||[])if(key&&!hidden.has(key)&&!by.has(key)&&!schemaKeyCandidates(domain,key).some(c=>by.has(c))){
       const d={name:key,type:key==='order'?'Number':['nullable','primary_key','indexed'].includes(key)?'Boolean':'Input',required:false,options:[]};
       by.set(key,d);defs.push(d);
     }
@@ -1742,14 +1823,16 @@ class SchemaStudioModal extends Modal {
       const group=this.getApiGroups().find(x=>x.key===apiName);const apiDocPath=normalizePath(group?.apiPath||`${this.plugin.settings.apiDocsFolder}/${apiName}.md`);await ensureFolder(this.app,this.plugin.settings.apiFieldsFolder);await ensureFolder(this.app,this.plugin.settings.apiDocsFolder);
       if(!this.app.vault.getAbstractFileByPath(apiDocPath))await this.app.vault.create(apiDocPath,`# ${apiName}\n\n## Request\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Request]]\n\n## Response\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Response]]\n`);
       const parentRaw=path.includes('.')?path.slice(0,path.lastIndexOf('.')):'';const parent=parentRaw.replace(/\[\]$/,'');const leaf=(path.includes('.')?path.slice(path.lastIndexOf('.')+1):path).replace(/\[\]$/,'');
-      const props=this.plugin.defaultPropertiesForDomain('api');const nextOrder=Math.max(0,...rows.filter(r=>r.direction===direction).map(r=>Number(r.order||0)))+10;
-      for(const [key,value] of Object.entries({api:`[[${apiDocPath.replace(/\.md$/,'')}]]`,direction,path,parent_path:parent,name:leaf,shape:values.shape||'Scalar',data_type:values.data_type||'string',order:nextOrder,schema_source:'manual',schema_orphaned:false}))setSchemaValue(props,'api',key,value);
+      const props=this.plugin.defaultPropertiesForDomain('api');
+      for(const [key,value] of Object.entries({api:`[[${apiDocPath.replace(/\.md$/,'')}]]`,direction,path,parent_path:parent,name:leaf,shape:values.shape||'Scalar',data_type:values.data_type||'string'}))setSchemaValue(props,'api',key,value);
+      purgeSchemaInternalKeys(props);
       const filePath=normalizePath(`${this.plugin.settings.apiFieldsFolder}/${core.makeApiFieldFilename(apiName,direction,path)}.md`);if(this.app.vault.getAbstractFileByPath(filePath)){new Notice(`目标文件已存在：${filePath}`);return;}await this.app.vault.create(filePath,`---\n${stringifyYaml(props)}---\n\n${noteBodyApiField(apiName,direction,canonicalSchemaRecord('api',props))}`);new Notice(`已新建 ${direction} / ${path}`);
     }else{
       const table=this.selectedKey;const name=String(values.name||'').trim();if(!name){new Notice('请输入列名');return;}if(rows.some(r=>r.name===name)){new Notice(`${name} 已存在`);return;}
       const group=this.getDbGroups().find(x=>x.key===table);const tableDocPath=normalizePath(group?.tablePath||`${this.plugin.settings.dbDocsFolder}/${table}.md`);await ensureFolder(this.app,this.plugin.settings.dbColumnsFolder);await ensureFolder(this.app,this.plugin.settings.dbDocsFolder);if(!this.app.vault.getAbstractFileByPath(tableDocPath))await this.app.vault.create(tableDocPath,`# ${table}\n\n## 字段\n\n![[${this.plugin.settings.dbBaseName}#当前数据表]]\n`);
-      const props=this.plugin.defaultPropertiesForDomain('db');const nextOrder=Math.max(0,...rows.map(r=>Number(r.order||0)))+10;
-      for(const [key,value] of Object.entries({table:`[[${tableDocPath.replace(/\.md$/,'')}]]`,name,data_type:values.data_type||'VARCHAR(255)',nullable:true,primary_key:false,indexed:false,order:nextOrder,schema_source:'manual',schema_orphaned:false}))setSchemaValue(props,'db',key,value);
+      const props=this.plugin.defaultPropertiesForDomain('db');
+      for(const [key,value] of Object.entries({table:`[[${tableDocPath.replace(/\.md$/,'')}]]`,name,data_type:values.data_type||'VARCHAR(255)',nullable:true,primary_key:false,indexed:false}))setSchemaValue(props,'db',key,value);
+      purgeSchemaInternalKeys(props);
       const filePath=normalizePath(`${this.plugin.settings.dbColumnsFolder}/${core.makeDbColumnFilename(table,name)}.md`);if(this.app.vault.getAbstractFileByPath(filePath)){new Notice(`目标文件已存在：${filePath}`);return;}await this.app.vault.create(filePath,`---\n${stringifyYaml(props)}---\n\n${noteBodyDbColumn(table,canonicalSchemaRecord('db',props))}`);new Notice(`已新建 ${table}.${name}`);
     }
     this.closeGridPopover();this.render();
@@ -2083,22 +2166,22 @@ class SchemaStudioModal extends Modal {
       const counts=countStatuses(a.diff);
       this.mainEl.createEl('h3',{text:`${a.apiName} / ${a.direction} · ${a.sourceName}`});
       this.mainEl.createDiv({text:`新增 ${counts.added} · 属性变化 ${counts.changed} · 未变化 ${counts.unchanged} · 源中消失 ${counts.removed}`,cls:'schema-tools-summary'});
-      const byDiff=new Map(a.diff.map(d=>[d.key,d])),byIncoming=new Map(a.incoming.map(r=>[r.path,r]));
-      const keys=[...a.incoming.map(r=>r.path),...a.diff.filter(d=>d.status==='removed').map(d=>d.key)];
+      const byDiff=new Map(a.diff.map(d=>[d.key,d])),byIncoming=new Map(a.incoming.map(r=>[r.key,r]));
+      const keys=[...a.incoming.map(r=>r.key),...a.diff.filter(d=>d.status==='removed').map(d=>d.key)];
       const models=keys.map(key=>{
         const d=byDiff.get(key),row=byIncoming.get(key);
         if(d?.status==='removed')return{
           key,status:'removed',
-          getValue:(name)=>d.before?.[name],
-          getBefore:(name)=>d.before?.[name],
+          getValue:(name)=>readSchemaCell(d.before,'api',name),
+          getBefore:(name)=>readSchemaCell(d.before,'api',name),
           setValue:()=>{},
           readonly:()=>true
         };
         return{
           key,status:d?.status||'unchanged',
-          getValue:(name)=>row?.[name],
-          getBefore:(name)=>d?.before?.[name],
-          setValue:(name,value)=>{if(row)row[name]=value;},
+          getValue:(name)=>readSchemaCell(row,'api',name),
+          getBefore:(name)=>readSchemaCell(d?.before,'api',name),
+          setValue:(name,value)=>{if(row)setSchemaValue(row,'api',name,value);},
           readonly:(name)=>NON_EDITABLE_IDENTITY_KEYS.has(name)
         };
       });
@@ -2106,12 +2189,37 @@ class SchemaStudioModal extends Modal {
     }
   }
   async applyOneApiAnalysis(a){
-    const now=new Date().toISOString(),folder=normalizePath(this.plugin.settings.apiFieldsFolder);await ensureFolder(this.app,folder);await ensureFolder(this.app,this.plugin.settings.apiDocsFolder);const apiDocPath=normalizePath(`${this.plugin.settings.apiDocsFolder}/${a.apiName}.md`);if(!this.app.vault.getAbstractFileByPath(apiDocPath))await this.app.vault.create(apiDocPath,`# ${a.apiName}\n\n## Request\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Request]]\n\n## Response\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Response]]\n`);
-    const exMap=new Map(a.existing.map(x=>[x.path,x]));const className=this.plugin.getFieldDefinitions('api').className;
-    for(const r of a.incoming){const old=exMap.get(r.path);const props=stripCacheKeys(r);delete props.key;props.fileClass=props.fileClass||className;setSchemaValue(props,'api','api',`[[${apiDocPath.replace(/\.md$/,'')}]]`);setSchemaValue(props,'api','direction',a.direction);setSchemaValue(props,'api','schema_source','json-sample');setSchemaValue(props,'api','schema_orphaned',false);setSchemaValue(props,'api','last_imported_at',now);if(old)await this.app.fileManager.processFrontMatter(old.file,fm=>{Object.assign(fm,props);});else{const path=normalizePath(`${folder}/${core.makeApiFieldFilename(a.apiName,a.direction,r.path)}.md`);await this.app.vault.create(path,`---\n${stringifyYaml(props)}---\n\n${noteBodyApiField(a.apiName,a.direction,canonicalSchemaRecord('api',props))}`);}}
-    for(const d of a.diff.filter(x=>x.status==='removed')){const old=exMap.get(d.key);if(old)await this.app.fileManager.processFrontMatter(old.file,fm=>{setSchemaValue(fm,'api','schema_orphaned',true);setSchemaValue(fm,'api','last_imported_at',now);});}
+    const now=new Date().toISOString(),folder=normalizePath(this.plugin.settings.apiFieldsFolder);await ensureFolder(this.app,folder);
+    // 接口文档优先落在现有字段已指向的位置；只有确实没有可依据的位置时才用设置里的目录。
+    const apiDocPath=this.resolveApiDocPath(a);
+    await ensureFolder(this.app,apiDocPath.split('/').slice(0,-1).join('/'));
+    const apiLink=`[[${apiDocPath.replace(/\.md$/,'')}]]`;
+    if(!this.app.vault.getAbstractFileByPath(apiDocPath))await this.app.vault.create(apiDocPath,`# ${a.apiName}\n\n## Request\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Request]]\n\n## Response\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Response]]\n`);
+    const exMap=new Map(a.existing.map(x=>[x.path,x]));const className=this.plugin.getFieldDefinitions('api').className;const statePatch={};
+    for(const r of a.incoming){const old=exMap.get(r.key);const props=stripCacheKeys(r);delete props.key;props.fileClass=props.fileClass||className;purgeSchemaInternalKeys(props);
+      // 已存在的字段文档保留它自己的接口链接，不按设置里的目录改写
+      if(!old){setSchemaValue(props,'api','api',apiLink);setSchemaValue(props,'api','direction',a.direction);}
+      if(old){await this.app.fileManager.processFrontMatter(old.file,fm=>{Object.assign(fm,props);purgeSchemaInternalKeys(fm);});statePatch[old.filePath]={source:'json-sample',orphaned:false,lastImportedAt:now};}
+      else{const path=normalizePath(`${folder}/${core.makeApiFieldFilename(a.apiName,a.direction,r.key)}.md`);await this.app.vault.create(path,`---\n${stringifyYaml(props)}---\n\n${noteBodyApiField(a.apiName,a.direction,canonicalSchemaRecord('api',props))}`);statePatch[path]={source:'json-sample',orphaned:false,lastImportedAt:now};}}
+    for(const d of a.diff.filter(x=>x.status==='removed')){const old=exMap.get(d.key);if(old){await this.app.fileManager.processFrontMatter(old.file,fm=>{purgeSchemaInternalKeys(fm);});statePatch[old.filePath]={source:'json-sample',orphaned:true,lastImportedAt:now};}}
+    await this.plugin.patchSchemaState(statePatch);
   }
   async applyJson(state){for(const a of state.analysis||[])await this.applyOneApiAnalysis(a);new Notice(`已更新 ${state.analysis?.length||0} 个接口方向 Schema`);this.domain='api';this.selectedKey=state.analysis?.[0]?.apiName||null;this.page='browse';this.importState=null;this.render();}
+
+  // 解析「本批要写入哪个表/接口文档」：优先沿用现有字段记录已指向、且确实存在的位置，
+  // 避免按设置里的扁平目录改写链接（多 Schema 分子目录的知识库里那会造成断链）。
+  resolveDocPathFromRows(rows, domain, name) {
+    const linkKey = domain === 'api' ? 'api' : 'table';
+    for (const row of rows) {
+      const link = schemaValue(row.fm, domain, linkKey);
+      const target = fmLinkPath(link);
+      if (target && this.app.vault.getAbstractFileByPath(`${target}.md`)) return `${target}.md`;
+    }
+    const folder = domain === 'api' ? this.plugin.settings.apiDocsFolder : this.plugin.settings.dbDocsFolder;
+    return normalizePath(`${folder}/${name}.md`);
+  }
+  resolveApiDocPath(a) { return this.resolveDocPathFromRows(a.existing, 'api', a.apiName); }
+  resolveDbDocPath(a) { return this.resolveDocPathFromRows(a.existing, 'db', a.table); }
 
   renderDdlImport(){
     const state=this.importState||{dialect:'mysql',ddlText:'',ddlFiles:[],focusTable:''};this.importState=state;this.renderPageHeader('DDL → 数据库 Schema','同一批文件使用同一方言；每个 CREATE TABLE 自动路由到对应表。');const form=this.mainEl.createDiv({cls:'schema-studio-form'});new Setting(form).setName('数据库方言').setDesc(DDL_DIALECTS[state.dialect]?.description||'').addDropdown(d=>{for(const x of Object.values(DDL_DIALECTS))d.addOption(x.id,x.label);d.setValue(state.dialect).onChange(v=>{state.dialect=v;this.render();});});this.renderMultiFileChooser('sql',state,'ddlFiles');
@@ -2119,7 +2227,15 @@ class SchemaStudioModal extends Modal {
   }
   buildDbAnalysis(table,sourceName){
     const existing=this.plugin.scanDbColumns().filter(x=>x.table===table.table),exMap=new Map(existing.map(x=>[x.name,x])),defaults=this.plugin.defaultPropertiesForDomain('db');
-    const incoming=table.columns.map(c=>{const old=exMap.get(c.name);const base=old?stripCacheKeys(old.fm):Object.assign({},defaults);const normalized=Object.assign({},c);if(c.references)normalized.references=`[[${normalizePath(this.plugin.settings.dbColumnsFolder)}/${core.makeDbColumnFilename(c.references.table,c.references.column)}]]`;else normalized.references='';for(const [key,value] of Object.entries(normalized))setSchemaValue(base,'db',key,value);base.key=c.name;return base;});
+    const incoming=table.columns.map(c=>{const old=exMap.get(c.name);const base=old?stripCacheKeys(old.fm):Object.assign({},defaults);
+      const normalized=Object.assign({},c);
+      // DDL 注释并入 `说明`（P4）：仅在现有说明为空时填入，不覆盖人工文案；
+      // `references` / `order` 属已废弃结构键，不再写入。
+      delete normalized.ddl_comment;delete normalized.references;delete normalized.order;
+      const comment=String(c.ddl_comment||'').trim();
+      if(comment&&!String(schemaValue(base,'db','description')||'').trim())normalized.description=comment;
+      for(const [key,value] of Object.entries(normalized))setSchemaValue(base,'db',key,value);
+      base.key=c.name;return base;});
     const existingCanonical=existing.map(x=>Object.assign({key:x.name},canonicalSchemaRecord('db',x.fm)));
     const incomingCanonical=incoming.map(x=>Object.assign({key:x.key},canonicalSchemaRecord('db',x)));
     const diff=core.diffRecords(existingCanonical,incomingCanonical,DB_IMPORT_MANAGED_KEYS);return {table:table.table,sourceName,incoming,existing,diff};
@@ -2138,22 +2254,22 @@ class SchemaStudioModal extends Modal {
       const counts=countStatuses(a.diff);
       this.mainEl.createEl('h3',{text:`${a.table} · ${a.sourceName}`});
       this.mainEl.createDiv({text:`新增 ${counts.added} · 属性变化 ${counts.changed} · 未变化 ${counts.unchanged} · DDL 中消失 ${counts.removed}`,cls:'schema-tools-summary'});
-      const byDiff=new Map(a.diff.map(d=>[d.key,d])),byIncoming=new Map(a.incoming.map(r=>[r.name,r]));
-      const keys=[...a.incoming.map(r=>r.name),...a.diff.filter(d=>d.status==='removed').map(d=>d.key)];
+      const byDiff=new Map(a.diff.map(d=>[d.key,d])),byIncoming=new Map(a.incoming.map(r=>[r.key,r]));
+      const keys=[...a.incoming.map(r=>r.key),...a.diff.filter(d=>d.status==='removed').map(d=>d.key)];
       const models=keys.map(key=>{
         const d=byDiff.get(key),row=byIncoming.get(key);
         if(d?.status==='removed')return{
           key,status:'removed',
-          getValue:(name)=>d.before?.[name],
-          getBefore:(name)=>d.before?.[name],
+          getValue:(name)=>readSchemaCell(d.before,'db',name),
+          getBefore:(name)=>readSchemaCell(d.before,'db',name),
           setValue:()=>{},
           readonly:()=>true
         };
         return{
           key,status:d?.status||'unchanged',
-          getValue:(name)=>row?.[name],
-          getBefore:(name)=>d?.before?.[name],
-          setValue:(name,value)=>{if(row)row[name]=value;},
+          getValue:(name)=>readSchemaCell(row,'db',name),
+          getBefore:(name)=>readSchemaCell(d?.before,'db',name),
+          setValue:(name,value)=>{if(row)setSchemaValue(row,'db',name,value);},
           readonly:(name)=>NON_EDITABLE_IDENTITY_KEYS.has(name)
         };
       });
@@ -2161,8 +2277,23 @@ class SchemaStudioModal extends Modal {
     }
   }
   async applyDdl(state){
-    const now=new Date().toISOString();await ensureFolder(this.app,this.plugin.settings.dbColumnsFolder);await ensureFolder(this.app,this.plugin.settings.dbDocsFolder);const className=this.plugin.getFieldDefinitions('db').className;
-    for(const a of state.analysis){const tableDocPath=normalizePath(`${this.plugin.settings.dbDocsFolder}/${a.table}.md`);if(!this.app.vault.getAbstractFileByPath(tableDocPath))await this.app.vault.create(tableDocPath,`# ${a.table}\n\n## 字段\n\n![[${this.plugin.settings.dbBaseName}#当前数据表]]\n`);const exMap=new Map(a.existing.map(x=>[x.name,x]));for(const r of a.incoming){const old=exMap.get(r.name);const props=stripCacheKeys(r);delete props.key;props.fileClass=props.fileClass||className;setSchemaValue(props,'db','table',`[[${tableDocPath.replace(/\.md$/,'')}]]`);setSchemaValue(props,'db','schema_source','ddl');setSchemaValue(props,'db','schema_dialect',state.dialect);setSchemaValue(props,'db','schema_orphaned',false);setSchemaValue(props,'db','last_imported_at',now);if(!r.default_value)for(const key of schemaKeyCandidates('db','default_value'))delete props[key];if(!r.ddl_comment)for(const key of schemaKeyCandidates('db','ddl_comment'))delete props[key];if(!r.references)for(const key of schemaKeyCandidates('db','references'))delete props[key];if(old)await this.app.fileManager.processFrontMatter(old.file,fm=>{Object.assign(fm,props);if(!r.default_value)for(const key of schemaKeyCandidates('db','default_value'))delete fm[key];if(!r.ddl_comment)for(const key of schemaKeyCandidates('db','ddl_comment'))delete fm[key];if(!r.references)for(const key of schemaKeyCandidates('db','references'))delete fm[key];});else{const path=normalizePath(`${this.plugin.settings.dbColumnsFolder}/${core.makeDbColumnFilename(a.table,r.name)}.md`);await this.app.vault.create(path,`---\n${stringifyYaml(props)}---\n\n${noteBodyDbColumn(a.table,canonicalSchemaRecord('db',props))}`);}}for(const d of a.diff.filter(x=>x.status==='removed')){const old=exMap.get(d.key);if(old)await this.app.fileManager.processFrontMatter(old.file,fm=>{setSchemaValue(fm,'db','schema_orphaned',true);setSchemaValue(fm,'db','last_imported_at',now);});}}
+    const now=new Date().toISOString();await ensureFolder(this.app,this.plugin.settings.dbColumnsFolder);const className=this.plugin.getFieldDefinitions('db').className;const statePatch={};
+    for(const a of state.analysis){
+      const exMap=new Map(a.existing.map(x=>[x.name,x]));
+      // 表文档优先落在现有列文件已指向且确实存在的位置；只有确实无从判断时才用设置目录。
+      const tableDocPath=this.resolveDbDocPath(a);
+      await ensureFolder(this.app,tableDocPath.split('/').slice(0,-1).join('/'));
+      const tableLink=`[[${tableDocPath.replace(/\.md$/,'')}]]`;
+      if(!this.app.vault.getAbstractFileByPath(tableDocPath))await this.app.vault.create(tableDocPath,`# ${a.table}\n\n## 字段\n\n![[${this.plugin.settings.dbBaseName}#当前数据表]]\n`);
+      for(const r of a.incoming){const old=exMap.get(r.key);const props=stripCacheKeys(r);delete props.key;props.fileClass=props.fileClass||className;purgeSchemaInternalKeys(props);
+        // 已存在的列文件保留它自己的 `数据表` 链接，不按设置里的目录改写
+        if(!old)setSchemaValue(props,'db','table',tableLink);
+        if(!r.default_value)for(const key of schemaKeyCandidates('db','default_value'))delete props[key];
+        if(old){await this.app.fileManager.processFrontMatter(old.file,fm=>{Object.assign(fm,props);purgeSchemaInternalKeys(fm);if(!r.default_value)for(const key of schemaKeyCandidates('db','default_value'))delete fm[key];});statePatch[old.filePath]={source:'ddl',dialect:state.dialect,orphaned:false,lastImportedAt:now};}
+        else{const path=normalizePath(`${this.plugin.settings.dbColumnsFolder}/${core.makeDbColumnFilename(a.table,r.key)}.md`);await this.app.vault.create(path,`---\n${stringifyYaml(props)}---\n\n${noteBodyDbColumn(a.table,canonicalSchemaRecord('db',props))}`);statePatch[path]={source:'ddl',dialect:state.dialect,orphaned:false,lastImportedAt:now};}}
+      for(const d of a.diff.filter(x=>x.status==='removed')){const old=exMap.get(d.key);if(old){await this.app.fileManager.processFrontMatter(old.file,fm=>{purgeSchemaInternalKeys(fm);});statePatch[old.filePath]={source:'ddl',dialect:state.dialect,orphaned:true,lastImportedAt:now};}}
+    }
+    await this.plugin.patchSchemaState(statePatch);
     new Notice(`已更新 ${state.analysis?.length||0} 张数据库表`);this.domain='db';this.selectedKey=state.focusTable||state.analysis?.[0]?.table||null;this.page='browse';this.importState=null;this.render();
   }
 }
@@ -2195,5 +2326,5 @@ function countStatuses(diff){const c={added:0,changed:0,unchanged:0,removed:0};f
 function labelStatus(s){return {added:'新增',changed:'变化',unchanged:'未变',removed:'消失'}[s]||s;}
 function changeSummary(d){if(!d||d.status!=='changed')return '';return '变更：'+d.changes.map(k=>`${k} ${JSON.stringify(d.before?.[k]??'')} → ${JSON.stringify(d.after?.[k]??'')}`).join('；');}
 
-SchemaToolsPlugin._test = { core, DDL_DIALECTS, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal };
+SchemaToolsPlugin._test = { core, DDL_DIALECTS, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell };
 module.exports = SchemaToolsPlugin;
