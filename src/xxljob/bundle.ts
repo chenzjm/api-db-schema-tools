@@ -21,6 +21,7 @@ import {
 	frontmatterBlock,
 	frontmatterEntries,
 	frontmatterToMarkdown,
+	normalizeFmScalar,
 	diffFrontmatter,
 	type FrontmatterChange,
 } from "./frontmatter";
@@ -141,6 +142,7 @@ export {
 	frontmatterBlock,
 	frontmatterEntries,
 	frontmatterToMarkdown,
+	normalizeFmScalar,
 	diffFrontmatter,
 	LINK_HEADINGS,
 	applyPlans,

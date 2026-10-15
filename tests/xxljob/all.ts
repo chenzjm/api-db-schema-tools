@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { parseXxlXml } from "../../src/xxljob/parser";
 import { buildFlowTree, mapEnum, ROUTE_MAP, resolveJobBeanName, sanitizeFileName } from "../../src/xxljob/mapping";
 import { buildImportPlans, mergePreservingBody, type TemplateSources } from "../../src/xxljob/writer";
-import { splitFrontmatter, frontmatterBlock, frontmatterEntries, frontmatterToMarkdown, diffFrontmatter } from "../../src/xxljob/frontmatter";
+import { splitFrontmatter, frontmatterBlock, frontmatterEntries, frontmatterToMarkdown, normalizeFmScalar, diffFrontmatter } from "../../src/xxljob/frontmatter";
 
 // 测试脚本统一从仓库根目录执行（npm test）
 const TPL_DIR = join(process.cwd(), "templates", "xxljob");
@@ -405,6 +405,35 @@ test("frontmatterToMarkdown：空值与多行值", () => {
 	const md = frontmatterToMarkdown("---\na: \nb:\n  - x\n  - y\n---\n正文");
 	assert.match(md, /\*\*a\*\*：（空）/, "空值用「（空）」占位");
 	assert.match(md, /\*\*b\*\*：\n?\s*- x/, "多行值缩进续行");
+});
+
+test("normalizeFmScalar：YAML 引号风格归一化", () => {
+	// 同一份 JSON 的两种 YAML 写法，归一化后应完全一致
+	const single = `'{"dayOffset":"-1","BIZ_MODE":["MYXH"]}'`;
+	const double = `"{\\"dayOffset\\":\\"-1\\",\\"BIZ_MODE\\":[\\"MYXH\\"]}"`;
+	assert.notEqual(single, double, "前置：两种写法文本不同");
+	assert.equal(normalizeFmScalar(single), normalizeFmScalar(double), "归一化后应相等");
+	assert.equal(normalizeFmScalar(single), '{"dayOffset":"-1","BIZ_MODE":["MYXH"]}');
+	// 普通标量不受影响
+	assert.equal(normalizeFmScalar("批任务"), "批任务");
+	assert.equal(normalizeFmScalar(""), "");
+	// 单引号内的 '' 表示一个引号
+	assert.equal(normalizeFmScalar("'a''b'"), "a'b");
+	// 多行值（续行列表）不被引号包裹：只 trim 首尾，续行缩进保留
+	assert.equal(normalizeFmScalar("  - x\n  - y"), "- x\n  - y");
+});
+
+test("diffFrontmatter：引号风格不同不算改动（任务参数不再每次都报）", () => {
+	const key = (q: string) => `---\nfileClass: 批任务\n任务参数: ${q}\n---\n\n# 任务说明\n`;
+	const oldStyle = key(`'{"dayOffset":"-1","TENANT_ID":"000"}'`);
+	const newStyle = key(`"{\\"dayOffset\\":\\"-1\\",\\"TENANT_ID\\":\\"000\\"}"`);
+	assert.deepEqual(diffFrontmatter(oldStyle, newStyle), [], "仅引号风格不同不应报改动");
+	// 内容真的变了仍要检出
+	const realChange = diffFrontmatter(oldStyle, key(`"{\\"dayOffset\\":\\"1\\",\\"TENANT_ID\\":\\"000\\"}"`));
+	const hit = realChange.find((c) => c.key === "任务参数");
+	assert.ok(hit && hit.type === "changed", `dayOffset 变了应报改动：${JSON.stringify(realChange)}`);
+	assert.ok(String(hit?.oldValue).includes('"dayOffset":"-1"'), "旧值应是归一化后的可读 JSON");
+	assert.ok(String(hit?.newValue).includes('"dayOffset":"1"'), "新值应是归一化后的可读 JSON");
 });
 
 test("无模板时回退内置结构", () => {
