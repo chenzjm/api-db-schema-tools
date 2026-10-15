@@ -1,11 +1,32 @@
 'use strict';
+const path = require('path');
 const {
   Plugin, Modal, Notice, Setting, PluginSettingTab, TFile, EditorSuggest, normalizePath, stringifyYaml, setIcon
 } = require('obsidian');
-// xxl-job XML 导入子模块：由 xxljob-flow-atlas 仓库构建产出（external obsidian）。
-// 没拷进来时整个 xxljob 域自动降级为不可用，不影响接口 / 数据库两条链路。
+// xxl-job XML 导入子模块：由本仓库 src/xxljob/ 构建产出（external obsidian），产物 xxljob-bundle.cjs 不入库。
+// 没构建 / 加载失败时整个 xxl-job 域自动降级为不可用，不影响接口 / 数据库两条链路。
 let xxl = null;
-try { xxl = require('./xxljob-bundle.cjs'); } catch (e) { console.warn('[Schema Studio] 未加载 xxljob-bundle.cjs，xxl-job 域不可用', e && e.message); }
+let xxlLoadError = '';
+function loadXxlBundle() {
+  const fs = require('fs');
+  const obsidian = require('obsidian');
+  const baseDir = typeof __dirname !== 'undefined' ? __dirname : path.dirname(module.filename || '.');
+  const bundlePath = path.join(baseDir, 'xxljob-bundle.cjs');
+  const src = fs.readFileSync(bundlePath, 'utf-8');
+  const mod = { exports: {} };
+  const fn = new Function('require', 'module', 'exports', '__dirname', '__filename', src);
+  fn((name) => {
+    if (name === 'obsidian') return obsidian;
+    return require(name);
+  }, mod, mod.exports, __dirname || '', bundlePath);
+  return mod.exports;
+}
+try {
+  xxl = loadXxlBundle();
+} catch (e) {
+  xxlLoadError = e && (e.message || String(e));
+  console.warn('[Schema Studio] 加载 xxljob-bundle.cjs 失败，xxl-job 域不可用', e);
+}
 const core = (() => {
 function sanitizeSegment(value) {
   return String(value ?? '')
@@ -1149,7 +1170,7 @@ class SchemaToolsSettingTab extends PluginSettingTab {
       }));
     containerEl.createEl('h3', { text: 'xxl-job XML 导入' });
     if (!xxl) {
-      containerEl.createEl('p', { text: '未加载 xxljob-bundle.cjs，xxl-job 域不可用。在 xxljob-flow-atlas 仓库执行 ./sync.sh to-vault 后重载插件即可。' });
+      containerEl.createEl('p', { text: '未加载 xxljob-bundle.cjs，xxl-job 域不可用。请在本仓库执行 npm install && npm run build:xxljob（./sync.sh to-vault 会自动构建并部署），然后重载插件。接口 / 数据库两条链路不受影响。' });
     }
     const xxlFolderFields = [['xxljobDocsFolder', '文档根目录']];
     for (const [key, name] of xxlFolderFields) {
@@ -2334,10 +2355,15 @@ class SchemaStudioModal extends Modal {
     row.createDiv({text:'可一次选择多个文件',cls:'schema-tools-muted'});if((state[key]||[]).length){const box=this.mainEl.createDiv({cls:'schema-studio-selected-files'});box.createDiv({text:`已选择 ${state[key].length} 个文件`,cls:'schema-tools-label'});for(const f of state[key])box.createDiv({text:f.name,cls:'schema-studio-file-chip'});}
   }
 
-  // --- xxl-job XML 导入：子模块 xxljob-flow-atlas ---
+  // --- xxl-job XML 导入：子模块 xxljob-bundle.cjs（由 src/xxljob/ 构建） ---
   xxljobUnavailable(){
     this.renderPageHeader('xxl-job XML 导入','子模块未加载');
-    this.mainEl.createDiv({text:'没有找到 xxljob-bundle.cjs，xxl-job 域不可用。请在 xxljob-flow-atlas 仓库执行 ./sync.sh to-vault（会把 bundle 拷进本插件目录），然后重载插件。接口 / 数据库两条链路不受影响。',cls:'schema-tools-callout'});
+    this.mainEl.createDiv({text:'xxl-job 域不可用：没有加载到 xxljob-bundle.cjs。请在本仓库执行 npm install && npm run build:xxljob（./sync.sh to-vault 会自动构建并把 bundle 拷进插件目录），然后重载插件。接口 / 数据库两条链路不受影响。',cls:'schema-tools-callout'});
+    // xxlLoadError 带出真实原因（产物缺失 / 依赖未装 / 构建失败），否则只能看到一句“域不可用”
+    if(xxlLoadError){
+      this.mainEl.createDiv({text:'加载错误',cls:'schema-tools-label'});
+      this.mainEl.createDiv({text:xxlLoadError,cls:'schema-studio-file-chip'});
+    }
   }
   async xxljobTemplates(notify=false){
     const s=xxlSettings(this.plugin);
