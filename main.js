@@ -120,7 +120,8 @@ function unquoteIdent(s) {
 }
 
 function normalizeType(type) {
-  return String(type || '').trim().replace(/\s+/g, ' ');
+  // 统一「NUMBER(10,0)」→「NUMBER(10, 0)」，与知识库里既有写法和 DDL 原文保持一致
+  return String(type || '').trim().replace(/\s+/g, ' ').replace(/\s*,\s*/g, ', ');
 }
 
 function parseCreateTables(sql) {
@@ -146,7 +147,10 @@ function parseCreateTables(sql) {
     if (depth !== 0) continue;
     const body = sql.slice(re.lastIndex, i - 1);
     re.lastIndex = i;
-    const tableName = unquoteIdent(rawName.split('.').pop());
+    // 支持 schema 限定的表名（如 "CAPITAL"."ACCOUNT_FILE_FLAG"）：schema 用于新建文档时落到对应子目录
+    const nameParts = String(rawName).split('.');
+    const tableName = unquoteIdent(nameParts.pop());
+    const schemaName = nameParts.length ? unquoteIdent(nameParts.pop()) : '';
     const parts = splitTopLevel(body);
     const columns = [];
     const pk = new Set();
@@ -206,7 +210,7 @@ function parseCreateTables(sql) {
       if (refs.has(c.name)) c.references = refs.get(c.name);
       c.order = (idx + 1) * 10;
     });
-    out.push({ table: tableName, columns });
+    out.push({ table: tableName, schema: schemaName, table_comment: '', columns });
   }
   return out;
 }
@@ -260,6 +264,8 @@ const DEFAULTS = {
   dbColumnsFolder: '_data/db-columns',
   apiBaseName: 'ApiFields.base',
   dbBaseName: 'DbColumns.base',
+  // 新建表文档时套用的模板；留空则回退到内置的最小结构
+  dbDocTemplate: '_template/业务模板/db-数据库-shuju/db-数据库-shuju.md',
   prioritizeInlineSuggest: true,
   gridViewPrefs: {
     api: { hiddenProps: [], sorts: [], filters: [] },
@@ -308,8 +314,18 @@ function noteBodyApiField(apiName, direction, row) {
   const parent = row.parent_path ? `\n父路径：\`${row.parent_path}\`` : '';
   return `# ${apiName}.${direction}.${row.path}\n\n${row.description || '待补充说明。'}\n\n所属接口：[[${apiName}]]\n方向：\`${direction}\`\n路径：\`${row.path}\`\n结构：\`${row.shape}\` / \`${row.data_type}\`${parent}\n`;
 }
-function noteBodyDbColumn(table, row) {
-  return `# ${table}.${row.name}\n\n${row.description || '待补充说明。'}\n\n所属表：[[${table}]]\n`;
+function noteBodyDbColumn(table, row, tableDocPath) {
+  const link = tableDocPath ? `[[${String(tableDocPath).replace(/\.md$/i, '')}|${table}]]` : `[[${table}]]`;
+  return `# ${table}.${row.name}\n\n${row.description || '待补充说明。'}\n\n所属表：${link}\n`;
+}
+
+// 模板正文里的 {{...}} 是填写提示：建表语句那处填入 DDL 原文，其余保留提示供人工填写
+function fillTemplatePlaceholders(text, ddlText) {
+  return String(text || '').replace(/\{\{([\s\S]*?)\}\}/g, (full, inner) => (/建表语句/.test(inner) ? String(ddlText || '').trim() : full));
+}
+function stripFrontmatterBlock(text) {
+  const m = String(text || '').match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
+  return m ? String(text).slice(m[0].length) : String(text || '');
 }
 
 
@@ -1061,6 +1077,12 @@ class SchemaToolsSettingTab extends PluginSettingTab {
       }));
     }
     new Setting(containerEl)
+      .setName('新建表文档的模板')
+      .setDesc('DDL 导入或手工新建数据库表时，套用这个模板生成表文档：表中文名取 DDL 的 COMMENT ON TABLE，数据库Schema、表名、建表语句自动填。留空则使用内置的最小结构。')
+      .addText(t => t.setValue(this.plugin.settings.dbDocTemplate || '').onChange(async v => {
+        this.plugin.settings.dbDocTemplate = v.trim(); await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl)
       .setName('让 @ Schema 联想优先于原生建议')
       .setDesc('默认开启。关闭后 Schema Studio 仍可使用，但 @ 可能被 Obsidian 或其他插件的建议器抢先。该开关也用于排查与 Bases / Fileclass 的兼容性问题。')
       .addToggle(t => t.setValue(this.plugin.settings.prioritizeInlineSuggest !== false).onChange(async v => {
@@ -1566,8 +1588,19 @@ function normalizePrimaryKeyNullability(parsed) {
   for (const table of parsed) for (const col of table.columns) if (col.primary_key) col.nullable = false;
 }
 
+// 表注释：COMMENT ON TABLE <schema.>?<table> IS '...'（表中文名的来源）
+function applyTableComments(parsed, sql) {
+  const re = /COMMENT\s+ON\s+TABLE\s+((?:"[^"]+"|[\w$#]+)\.)?("[^"]+"|[\w$#]+)\s+IS\s+'((?:''|[^'])*)'\s*(?:;|\/|$)/ig;
+  let m;
+  while ((m = re.exec(sql))) {
+    const table = findParsedTable(parsed, m[2]);
+    if (table) table.table_comment = m[3].replace(/''/g, "'");
+  }
+}
+
 function parseMySqlDdl(sql) {
   const parsed = core.parseCreateTables(sql);
+  applyTableComments(parsed, sql);
   markIndexColumns(parsed, sql);
   applyAlterTableConstraints(parsed, sql);
   normalizePrimaryKeyNullability(parsed);
@@ -1589,6 +1622,7 @@ function parseOracleDdl(sql) {
     const col = findColumn(table, m[3]);
     if (col) col.ddl_comment = m[4].replace(/''/g, "'");
   }
+  applyTableComments(parsed, sql);
 
   // Oracle PK/FK/UNIQUE are frequently emitted as ALTER TABLE statements;
   // indexes are also commonly emitted separately.
@@ -1857,11 +1891,11 @@ class SchemaStudioModal extends Modal {
       const filePath=normalizePath(`${this.plugin.settings.apiFieldsFolder}/${core.makeApiFieldFilename(apiName,direction,path)}.md`);if(this.app.vault.getAbstractFileByPath(filePath)){new Notice(`目标文件已存在：${filePath}`);return;}await this.app.vault.create(filePath,`---\n${stringifyYaml(props)}---\n\n${noteBodyApiField(apiName,direction,canonicalSchemaRecord('api',props))}`);new Notice(`已新建 ${direction} / ${path}`);
     }else{
       const table=this.selectedKey;const name=String(values.name||'').trim();if(!name){new Notice('请输入列名');return;}if(rows.some(r=>r.name===name)){new Notice(`${name} 已存在`);return;}
-      const group=this.getDbGroups().find(x=>x.key===table);const tableDocPath=normalizePath(group?.tablePath||`${this.plugin.settings.dbDocsFolder}/${table}.md`);await ensureFolder(this.app,this.plugin.settings.dbColumnsFolder);await ensureFolder(this.app,this.plugin.settings.dbDocsFolder);if(!this.app.vault.getAbstractFileByPath(tableDocPath))await this.app.vault.create(tableDocPath,`# ${table}\n\n## 字段\n\n![[${this.plugin.settings.dbBaseName}#当前数据表]]\n`);
+      const group=this.getDbGroups().find(x=>x.key===table);const tableDocPath=normalizePath(group?.tablePath||`${this.plugin.settings.dbDocsFolder}/${table}.md`);await ensureFolder(this.app,this.plugin.settings.dbColumnsFolder);await ensureFolder(this.app,this.plugin.settings.dbDocsFolder);if(!this.app.vault.getAbstractFileByPath(tableDocPath))await this.app.vault.create(tableDocPath,await this.renderNewTableDoc({table,schema:'',tableComment:''},''));
       const props=this.plugin.defaultPropertiesForDomain('db');
       for(const [key,value] of Object.entries({table:`[[${tableDocPath.replace(/\.md$/,'')}]]`,name,data_type:values.data_type||'VARCHAR(255)',nullable:true,primary_key:false,indexed:false}))setSchemaValue(props,'db',key,value);
       purgeSchemaInternalKeys(props);
-      const filePath=normalizePath(`${this.plugin.settings.dbColumnsFolder}/${core.makeDbColumnFilename(table,name)}.md`);if(this.app.vault.getAbstractFileByPath(filePath)){new Notice(`目标文件已存在：${filePath}`);return;}await this.app.vault.create(filePath,`---\n${stringifyYaml(props)}---\n\n${noteBodyDbColumn(table,canonicalSchemaRecord('db',props))}`);new Notice(`已新建 ${table}.${name}`);
+      const filePath=normalizePath(`${this.plugin.settings.dbColumnsFolder}/${core.makeDbColumnFilename(table,name)}.md`);if(this.app.vault.getAbstractFileByPath(filePath)){new Notice(`目标文件已存在：${filePath}`);return;}await this.app.vault.create(filePath,`---\n${stringifyYaml(props)}---\n\n${noteBodyDbColumn(table,canonicalSchemaRecord('db',props),tableDocPath)}`);new Notice(`已新建 ${table}.${name}`);
     }
     this.closeGridPopover();this.render();
   }
@@ -2243,7 +2277,7 @@ class SchemaStudioModal extends Modal {
 
   // 解析「本批要写入哪个表/接口文档」：优先沿用现有字段记录已指向、且确实存在的位置，
   // 避免按设置里的扁平目录改写链接（多 Schema 分子目录的知识库里那会造成断链）。
-  resolveDocPathFromRows(rows, domain, name) {
+  resolveDocPathFromRows(rows, domain, name, schema) {
     const linkKey = domain === 'api' ? 'api' : 'table';
     for (const row of rows) {
       const link = schemaValue(row.fm, domain, linkKey);
@@ -2251,10 +2285,37 @@ class SchemaStudioModal extends Modal {
       if (target && this.app.vault.getAbstractFileByPath(`${target}.md`)) return `${target}.md`;
     }
     const folder = domain === 'api' ? this.plugin.settings.apiDocsFolder : this.plugin.settings.dbDocsFolder;
-    return normalizePath(`${folder}/${name}.md`);
+    // 全新的表：DDL 里带 schema 时落到同名子目录（如 CAPITAL → 7.db/capital/），与多 Schema 目录结构一致
+    const sub = domain === 'db' && String(schema || '').trim()
+      ? normalizePath(`${folder}/${String(schema).trim().toLowerCase()}`)
+      : normalizePath(folder);
+    return normalizePath(`${sub}/${name}.md`);
+  }
+
+  // 新建表文档：按模板生成（表中文名取 DDL 的表注释，数据库Schema / 表名自动填，建表语句放 DDL 原文）
+  async renderNewTableDoc(a, ddlText) {
+    const fallback = `# ${a.table}\n\n## 字段\n\n![[${this.plugin.settings.dbBaseName}#当前数据表]]\n`;
+    const tplPath = normalizePath(String(this.plugin.settings.dbDocTemplate || '').replace(/\.md$/i, ''));
+    if (!tplPath) return fallback;
+    const file = this.app.vault.getAbstractFileByPath(`${tplPath}.md`);
+    if (!file) return fallback;
+    let raw = '';
+    try { raw = await this.app.vault.read(file); } catch (e) { return fallback; }
+    const fm = Object.assign({}, this.app.metadataCache.getFileCache(file)?.frontmatter || {});
+    for (const key of Object.keys(fm)) if (FRONTMATTER_INTERNAL_KEYS.has(key)) delete fm[key];
+    // 能自动确定的键用真实值覆盖（保持模板原有的键顺序）；其余保留模板里的 {{填写提示}} 作为待填提醒
+    fm['表名'] = a.table;
+    const schema = String(a.schema || '').trim().toLowerCase();
+    if (schema) fm['数据库Schema'] = schema;
+    const cnName = String(a.tableComment || '').trim();
+    if (cnName) fm['表中文名'] = cnName;
+    if (!('是否入仓' in fm)) fm['是否入仓'] = false;
+    if (!('是否被抽数' in fm)) fm['是否被抽数'] = false;
+    const body = fillTemplatePlaceholders(stripFrontmatterBlock(raw), ddlText);
+    return `---\n${stringifyYaml(fm)}---\n\n${body.replace(/^\n+/, '')}`;
   }
   resolveApiDocPath(a) { return this.resolveDocPathFromRows(a.existing, 'api', a.apiName); }
-  resolveDbDocPath(a) { return this.resolveDocPathFromRows(a.existing, 'db', a.table); }
+  resolveDbDocPath(a) { return this.resolveDocPathFromRows(a.existing, 'db', a.table, a.schema); }
 
   renderDdlImport(){
     const state=this.importState||{dialect:'mysql',ddlText:'',ddlFiles:[],focusTable:''};this.importState=state;this.renderPageHeader('DDL → 数据库 Schema','同一批文件使用同一方言；每个 CREATE TABLE 自动路由到对应表。');const form=this.mainEl.createDiv({cls:'schema-studio-form'});new Setting(form).setName('数据库方言').setDesc(DDL_DIALECTS[state.dialect]?.description||'').addDropdown(d=>{for(const x of Object.values(DDL_DIALECTS))d.addOption(x.id,x.label);d.setValue(state.dialect).onChange(v=>{state.dialect=v;this.render();});});this.renderMultiFileChooser('sql',state,'ddlFiles');
@@ -2273,7 +2334,7 @@ class SchemaStudioModal extends Modal {
       base.key=c.name;return base;});
     const existingCanonical=existing.map(x=>Object.assign({key:x.name},canonicalSchemaRecord('db',x.fm)));
     const incomingCanonical=incoming.map(x=>Object.assign({key:x.key},canonicalSchemaRecord('db',x)));
-    const diff=core.diffRecords(existingCanonical,incomingCanonical,DB_IMPORT_MANAGED_KEYS);return {table:table.table,sourceName,incoming,existing,diff};
+    const diff=core.diffRecords(existingCanonical,incomingCanonical,DB_IMPORT_MANAGED_KEYS);return {table:table.table,schema:table.schema||'',tableComment:table.table_comment||'',sourceName,incoming,existing,diff};
   }
   analyzeDdl(state){
     const sources=[...(state.ddlFiles||[])];if((state.ddlText||'').trim())sources.push({name:'DDL 字符串',text:state.ddlText});if(!sources.length){new Notice('请选择 DDL 文件或粘贴 SQL');return;}const analyses=[];const seen=new Set();try{for(const source of sources){const parsed=parseDdlWithDialect(source.text,state.dialect);for(const t of parsed){const key=t.table.toLowerCase();if(seen.has(key))throw new Error(`同一批次重复定义表：${t.table}`);seen.add(key);analyses.push(this.buildDbAnalysis(t,source.name));}}}catch(e){new Notice(`DDL 解析失败：${e.message}`);return;}if(!analyses.length){new Notice(`没有识别到 ${DDL_DIALECTS[state.dialect].label} CREATE TABLE`);return;}state.analysis=analyses;this.page='ddl-diff';this.render();
@@ -2321,7 +2382,8 @@ class SchemaStudioModal extends Modal {
       const tableDocPath=this.resolveDbDocPath(a);
       await ensureFolder(this.app,tableDocPath.split('/').slice(0,-1).join('/'));
       const tableLink=`[[${tableDocPath.replace(/\.md$/,'')}]]`;
-      if(!this.app.vault.getAbstractFileByPath(tableDocPath))await this.app.vault.create(tableDocPath,`# ${a.table}\n\n## 字段\n\n![[${this.plugin.settings.dbBaseName}#当前数据表]]\n`);
+      // 新建的表文档按模板生成（表中文名取 DDL 的表注释、数据库Schema、表名、建表语句自动填）
+      if(!this.app.vault.getAbstractFileByPath(tableDocPath))await this.app.vault.create(tableDocPath,await this.renderNewTableDoc(a,state.ddlText||''));
       for(const r of a.incoming){const old=exMap.get(r.key);const props=stripCacheKeys(r);delete props.key;props.fileClass=props.fileClass||className;purgeSchemaInternalKeys(props);
         // 已存在的列文件保留它自己的 `数据表` 链接，不按设置里的目录改写
         if(!old)setSchemaValue(props,'db','table',tableLink);
@@ -2333,7 +2395,7 @@ class SchemaStudioModal extends Modal {
           // 名字没匹配上、但该文件确实存在时，按路径更新它，而不是新建（新建会因重名直接抛错中断整批导入）
           const byPath=exPathMap.get(path);
           if(byPath){dropBlankGuardedValues('db',props);await this.app.fileManager.processFrontMatter(byPath.file,fm=>{Object.assign(fm,props);purgeSchemaInternalKeys(fm);if(!r.default_value)for(const key of schemaKeyCandidates('db','default_value'))delete fm[key];});statePatch[byPath.filePath]={source:'ddl',dialect:state.dialect,orphaned:false,lastImportedAt:now};}
-          else{await this.app.vault.create(path,`---\n${stringifyYaml(props)}---\n\n${noteBodyDbColumn(a.table,canonicalSchemaRecord('db',props))}`);statePatch[path]={source:'ddl',dialect:state.dialect,orphaned:false,lastImportedAt:now};}}}
+          else{await this.app.vault.create(path,`---\n${stringifyYaml(props)}---\n\n${noteBodyDbColumn(a.table,canonicalSchemaRecord('db',props),tableDocPath)}`);statePatch[path]={source:'ddl',dialect:state.dialect,orphaned:false,lastImportedAt:now};}}}
       for(const d of a.diff.filter(x=>x.status==='removed')){const old=exMap.get(d.key);if(old){await this.app.fileManager.processFrontMatter(old.file,fm=>{purgeSchemaInternalKeys(fm);});statePatch[old.filePath]={source:'ddl',dialect:state.dialect,orphaned:true,lastImportedAt:now};}}
     }
     await this.plugin.patchSchemaState(statePatch);
@@ -2369,5 +2431,5 @@ function countStatuses(diff){const c={added:0,changed:0,unchanged:0,removed:0};f
 function labelStatus(s){return {added:'新增',changed:'变化',unchanged:'未变',removed:'消失'}[s]||s;}
 function changeSummary(d){if(!d||d.status!=='changed')return '';return '变更：'+d.changes.map(k=>`${k} ${JSON.stringify(d.before?.[k]??'')} → ${JSON.stringify(d.after?.[k]??'')}`).join('；');}
 
-SchemaToolsPlugin._test = { core, DDL_DIALECTS, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell };
+SchemaToolsPlugin._test = { core, DDL_DIALECTS, DEFAULTS, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell };
 module.exports = SchemaToolsPlugin;

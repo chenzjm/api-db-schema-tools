@@ -6,6 +6,36 @@ Schema Studio 用于维护接口字段和数据库字段。底层仍然是普通
 
 迁移兼容：插件仍可读取历史英文属性；新建、保存和重新导入接口字段时，会统一写入中文属性。`ApiField`、`DbColumn` 是插件识别用的技术类名，不是团队需要记忆的业务字段名称。
 
+## v0.8.2：新建表文档按模板生成（含 schema 子目录与表注释）
+
+新增表（DDL 导入新建、或在界面手工新建）时，表文档不再是一个最小空壳，而是套用可配置的模板。
+
+### 1. 表文档模板
+
+新增设置项 **「新建表文档的模板」**（`dbDocTemplate`，默认 `_template/业务模板/db-数据库-shuju/db-数据库-shuju.md`）。
+生成时自动填充模板里的：
+
+| 模板字段 | 取值 |
+|---|---|
+| `表名` | CREATE TABLE 的表名（自动去掉 schema 前缀与引号） |
+| `数据库Schema` | DDL 里的 schema，如 `"CAPITAL"` → `capital` |
+| `表中文名` | `COMMENT ON TABLE ... IS '...'` 的表注释 |
+| `建表语句` 代码块 | DDL 原文 |
+
+模板里其余的 `{{...}}` 填写提示原样保留，作为人工填写提醒。模板文件不存在时回退到内置的最小结构。
+
+### 2. 新增表注释与 schema 解析
+
+- 新增 `applyTableComments()`：解析 `COMMENT ON TABLE <schema.>?<table> IS '...'`（表中文名的来源）。
+- `CREATE TABLE` 支持 schema 限定名 `"CAPITAL"."ACCOUNT_FILE_FLAG"`，解析后同时记录 schema。
+- 全部为新建表时，表文档落到同名 schema 子目录（如 `7.db/capital/ACCOUNT_FILE_FLAG.md`），
+  与多 Schema 的目录结构一致，不再丢在 `7.db/` 根目录。
+
+### 3. 其他
+
+- 数据类型归一补上逗号后的空格：`NUMBER(10,0)` → `NUMBER(10, 0)`。
+- 新建的列文件正文「所属表」使用完整路径链接（`[[7.db/capital/X|X]]`），与既有文件一致。
+
 ## v0.8.1：导入不再因文件损坏而中断，类型解析不再混入约束尾巴
 
 修复真实导入中暴露的三类问题。
