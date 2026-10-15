@@ -1,4 +1,5 @@
-import { App, TFile, normalizePath } from "obsidian";
+import type { App } from "obsidian";
+import { TFile, normalizePath } from "./obsidian-api";
 import type { FilePlan } from "./types";
 import { mergePreservingBody } from "./writer";
 import type { ConflictPolicy } from "./settings";

@@ -1,4 +1,5 @@
-import { App, Modal, Notice, Setting, TFile } from "obsidian";
+import type { App } from "obsidian";
+import { Modal, Notice, Setting, TFile } from "../obsidian-api";
 import { parseXxlXml } from "../parser";
 import { buildFlowTree, levelToDocKind, type FlowTree } from "../mapping";
 import { buildImportPlans, type TemplateSources } from "../writer";

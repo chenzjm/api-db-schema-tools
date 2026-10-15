@@ -1,4 +1,5 @@
-import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
+import type { App } from "obsidian";
+import { Plugin, PluginSettingTab, Setting } from "./obsidian-api";
 import {
 	executorListToText,
 	textToExecutorList,

@@ -79,6 +79,9 @@ Module._load = function (request, parent, isMain) {
 	return origLoad.call(this, request, parent, isMain);
 };
 
+// bundle 优先从全局取 obsidian API（与 Schema Studio 宿主注入方式一致）
+globalThis.__schemaStudioObsidian = obsidianStub;
+
 const bundlePath = new URL("../xxljob-bundle.cjs", import.meta.url);
 assert.ok(existsSync(bundlePath), "先跑 npm run build 产出 xxljob-bundle.cjs");
 const xxl = require(bundlePath.pathname);

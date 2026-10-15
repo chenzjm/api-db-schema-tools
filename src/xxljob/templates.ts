@@ -1,4 +1,5 @@
-import { App, Notice, TFile, normalizePath } from "obsidian";
+import type { App } from "obsidian";
+import { Notice, TFile, normalizePath } from "./obsidian-api";
 import type { TemplateSources } from "./writer";
 
 export interface TemplatePaths {

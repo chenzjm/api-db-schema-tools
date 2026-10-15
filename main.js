@@ -3,30 +3,82 @@ const path = require('path');
 const {
   Plugin, Modal, Notice, Setting, PluginSettingTab, TFile, EditorSuggest, normalizePath, stringifyYaml, setIcon
 } = require('obsidian');
-// xxl-job XML 导入子模块：由本仓库 src/xxljob/ 构建产出（external obsidian），产物 xxljob-bundle.cjs 不入库。
-// 没构建 / 加载失败时整个 xxl-job 域自动降级为不可用，不影响接口 / 数据库两条链路。
+// xxl-job XML 导入子模块：由本仓库 src/xxljob/ 构建产出，产物 xxljob-bundle.cjs 不入库。
+// bundle 内部不再 require('obsidian')（Obsidian 对插件子模块的 require 解析不可靠，会一路
+// 解析到 electron.asar 抛 Invalid package）——宿主先把 API 挂到全局 __schemaStudioObsidian，
+// bundle 统一从全局取。没构建 / 加载失败时整个 xxl-job 域自动降级，不影响接口 / 数据库两条链路。
+const XXL_OBSIDIAN_KEY = '__schemaStudioObsidian';
 let xxl = null;
 let xxlLoadError = '';
-function loadXxlBundle() {
-  const fs = require('fs');
-  const obsidian = require('obsidian');
-  const baseDir = typeof __dirname !== 'undefined' ? __dirname : path.dirname(module.filename || '.');
-  const bundlePath = path.join(baseDir, 'xxljob-bundle.cjs');
-  const src = fs.readFileSync(bundlePath, 'utf-8');
+let xxlLoadLog = [];
+function xxlErrText(e) { return (e && (e.message || String(e))) || String(e); }
+function ensureXxlGlobal() {
+  if (!globalThis[XXL_OBSIDIAN_KEY]) {
+    globalThis[XXL_OBSIDIAN_KEY] = { Plugin, Modal, Notice, Setting, PluginSettingTab, TFile, EditorSuggest, normalizePath, stringifyYaml, setIcon };
+  }
+  return globalThis[XXL_OBSIDIAN_KEY];
+}
+function evalXxlSource(src, dirHint) {
+  const api = ensureXxlGlobal();
   const mod = { exports: {} };
   const fn = new Function('require', 'module', 'exports', '__dirname', '__filename', src);
-  fn((name) => {
-    if (name === 'obsidian') return obsidian;
-    return require(name);
-  }, mod, mod.exports, __dirname || '', bundlePath);
+  const fakeRequire = (name) => {
+    if (name === 'obsidian') return api;
+    throw new Error('xxljob-bundle 请求了宿主未提供的模块：' + name);
+  };
+  fn(fakeRequire, mod, mod.exports, dirHint || '', dirHint ? dirHint + '/xxljob-bundle.cjs' : 'xxljob-bundle.cjs');
   return mod.exports;
 }
-try {
-  xxl = loadXxlBundle();
-} catch (e) {
-  xxlLoadError = e && (e.message || String(e));
-  console.warn('[Schema Studio] 加载 xxljob-bundle.cjs 失败，xxl-job 域不可用', e);
+function xxlCandidateDirs() {
+  const dirs = [];
+  if (typeof __dirname !== 'undefined' && __dirname) dirs.push(__dirname);
+  try {
+    if (module && module.filename) {
+      const d = path.dirname(module.filename);
+      if (dirs.indexOf(d) === -1) dirs.push(d);
+    }
+  } catch (e) { /* 忽略 */ }
+  return dirs;
 }
+function loadXxlBundle(extraDir) {
+  const log = [];
+  const dirs = [];
+  if (extraDir && dirs.indexOf(extraDir) === -1) dirs.push(extraDir);
+  for (const d of xxlCandidateDirs()) if (dirs.indexOf(d) === -1) dirs.push(d);
+  // 1) 常规 require：bundle 内已无 require('obsidian')，相对路径解析正常时这条路最快
+  try {
+    ensureXxlGlobal();
+    const m = require('./xxljob-bundle.cjs');
+    if (m && typeof m === 'object' && Object.keys(m).length) return { mod: m, log: ['require: 成功'] };
+    log.push('require: 返回空模块');
+  } catch (e) { log.push('require: ' + xxlErrText(e)); }
+  // 2) 读文件 + eval：完全不依赖 Node 模块解析
+  let fs = null;
+  try { fs = require('fs'); } catch (e) { log.push('require(fs): ' + xxlErrText(e)); }
+  if (fs) {
+    for (const d of dirs) {
+      try {
+        const p = path.join(d, 'xxljob-bundle.cjs');
+        const src = fs.readFileSync(p, 'utf-8');
+        const mod = evalXxlSource(src, d);
+        log.push('eval(' + p + '): 成功');
+        return { mod, log };
+      } catch (e) { log.push('eval ' + d + ': ' + xxlErrText(e)); }
+    }
+  }
+  return { mod: null, log };
+}
+function bootXxl(extraDir) {
+  const r = loadXxlBundle(extraDir);
+  if (r.mod) { xxl = r.mod; xxlLoadError = ''; xxlLoadLog = r.log; return true; }
+  if (!xxl) {
+    xxlLoadLog = r.log;
+    xxlLoadError = r.log.length ? r.log[r.log.length - 1] : '未知错误';
+    console.warn('[Schema Studio] 加载 xxljob-bundle.cjs 失败，xxl-job 域不可用\n  ' + r.log.join('\n  '));
+  }
+  return false;
+}
+bootXxl(null);
 const core = (() => {
 function sanitizeSegment(value) {
   return String(value ?? '')
@@ -866,6 +918,8 @@ class DemoRestoreModal extends Modal {
 
 class SchemaToolsPlugin extends Plugin {
   async onload() {
+    // 顶层加载若因 __dirname/module.filename 异常失败，这里用 manifest.dir 再试一次
+    if (!xxl && this.manifest && this.manifest.dir) bootXxl(this.manifest.dir);
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
     this.schemaState = { version: 1, updatedAt: '', records: {} };
     await this.loadSchemaState();
@@ -2359,10 +2413,14 @@ class SchemaStudioModal extends Modal {
   xxljobUnavailable(){
     this.renderPageHeader('xxl-job XML 导入','子模块未加载');
     this.mainEl.createDiv({text:'xxl-job 域不可用：没有加载到 xxljob-bundle.cjs。请在本仓库执行 npm install && npm run build:xxljob（./sync.sh to-vault 会自动构建并把 bundle 拷进插件目录），然后重载插件。接口 / 数据库两条链路不受影响。',cls:'schema-tools-callout'});
-    // xxlLoadError 带出真实原因（产物缺失 / 依赖未装 / 构建失败），否则只能看到一句“域不可用”
+    // xxlLoadError / xxlLoadLog 带出真实原因与逐步尝试记录（产物缺失 / 路径不对 / 构建失败）
     if(xxlLoadError){
       this.mainEl.createDiv({text:'加载错误',cls:'schema-tools-label'});
       this.mainEl.createDiv({text:xxlLoadError,cls:'schema-studio-file-chip'});
+    }
+    if(xxlLoadLog && xxlLoadLog.length){
+      this.mainEl.createDiv({text:'加载过程',cls:'schema-tools-label'});
+      for(const line of xxlLoadLog)this.mainEl.createDiv({text:line,cls:'schema-studio-file-chip'});
     }
   }
   async xxljobTemplates(notify=false){
