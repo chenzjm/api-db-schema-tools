@@ -3168,7 +3168,7 @@ class SchemaStudioModal extends Modal {
       button.onclick=(event)=>{event.preventDefault();event.stopPropagation();options.onSort?.(def.name,event);};
     }
     const body=table.createEl('tbody');
-    const state={anchor:null,focus:null,cells:[],editing:null,mouseDown:false,mouseMoved:false,mouseWasFocused:false};
+    const state={anchor:null,focus:null,cells:[],editing:null,mouseDown:false,mouseMoved:false,mouseWasFocused:false,history:[],future:[]};
     const cellAt=(r,c)=>state.cells.find(x=>x.r===r&&x.c===c);
     const refreshSelection=()=>{
       const a=state.anchor,f=state.focus;
@@ -3188,6 +3188,44 @@ class SchemaStudioModal extends Modal {
     const getRange=()=>{
       if(!state.anchor||!state.focus)return null;
       return {r1:Math.min(state.anchor.r,state.focus.r),r2:Math.max(state.anchor.r,state.focus.r),c1:Math.min(state.anchor.c,state.focus.c),c2:Math.max(state.anchor.c,state.focus.c)};
+    };
+    // --- 编辑历史（撤销 / 重做）------------------------------------------------
+    // 每次「提交一批修改」（编辑单元格、区域粘贴、剪切、清空、布尔切换）记录受影响单元格
+    // 的旧值；撤销按批回写，重做反向回写。**所有改值都必须经 applyValue** —— 新增一条写值
+    // 的代码路径时务必也走它，否则那条路径就撤不回来（对端踩过这个坑）。
+    const HISTORY_LIMIT=80;
+    const canWrite=(cell)=>!!cell&&options.editable&&cell.model.status!=='removed'&&!cell.model.readonly?.(cell.def.name);
+    const pushHistory=(batch)=>{
+      if(!batch||!batch.length)return;
+      state.history.push(batch);
+      if(state.history.length>HISTORY_LIMIT)state.history.shift();
+      state.future.length=0;   // 产生新分支后，原来的重做链作废
+    };
+    const applyValue=(cell,value,batch)=>{
+      const field=cell.def.name;
+      const before=cell.model.getValue(field);
+      if(valuesEqual(before,value))return false;
+      cell.model.setValue(field,value);
+      renderCell(cell);
+      if(batch)batch.push({cell,field,before,after:value});
+      return true;
+    };
+    // 撤销/重做不会在编辑态被调用：单元格的 keydown 开头就 `if(state.editing)return`，
+    // 焦点在输入框时 Ctrl/Cmd+Z 交给输入框自己撤销刚打的字（原生行为），不动表格历史。
+    const undoEdit=()=>{
+      const batch=state.history.pop();
+      if(!batch){new Notice('没有可撤销的修改');return;}
+      for(let i=batch.length-1;i>=0;i--){const it=batch[i];it.cell.model.setValue(it.field,it.before);renderCell(it.cell);}
+      state.future.push(batch);
+      new Notice(`已撤销 ${batch.length} 个单元格修改`);
+    };
+    const redoEdit=()=>{
+      const batch=state.future.pop();
+      if(!batch){new Notice('没有可重做的修改');return;}
+      for(const it of batch){it.cell.model.setValue(it.field,it.after);renderCell(it.cell);}
+      state.history.push(batch);
+      if(state.history.length>HISTORY_LIMIT)state.history.shift();
+      new Notice(`已重做 ${batch.length} 个单元格修改`);
     };
     const renderCell=(cell)=>{
       const {td,model,def}=cell;td.empty();
@@ -3217,7 +3255,7 @@ class SchemaStudioModal extends Modal {
         if(input.tagName==='SELECT')v=input.value;
         else if(input.type==='checkbox')v=input.checked;
         else v=clipboardValueForType(input.value,cell.def);
-        cell.model.setValue(cell.def.name,v);
+        const batch=[];applyValue(cell,v,batch);pushHistory(batch);
       }
       if(state.editing?.input===input)state.editing=null;
       if(this.activeGridEditor?.input===input)this.activeGridEditor=null;
@@ -3235,8 +3273,7 @@ class SchemaStudioModal extends Modal {
       cell.td.empty();cell.td.addClass('is-editing');
       let input;
       if(type==='boolean'){
-        cell.model.setValue(cell.def.name,!Boolean(cur));
-        renderCell(cell);
+        const batch=[];applyValue(cell,!Boolean(cur),batch);pushHistory(batch);
         cell.td.focus();
         return;
       }else if(type==='select'&&cell.def.options?.length){
@@ -3292,24 +3329,41 @@ class SchemaStudioModal extends Modal {
       for(let r=rg.r1;r<=rg.r2;r++){const vals=[];for(let c=rg.c1;c<=rg.c2;c++){const cell=cellAt(r,c);vals.push(displayGridValue(cell?.model.getValue(cell.def.name)));}lines.push(vals.join('\t'));}
       e.clipboardData?.setData('text/plain',lines.join('\n'));e.preventDefault();
     };
+    const selectAll=()=>{
+      if(!models.length||!defs.length)return;
+      state.anchor={r:0,c:0};state.focus={r:models.length-1,c:defs.length-1};
+      refreshSelection();
+    };
+    // 剪切：先写剪贴板，再把区域清空（只清可写的单元格，只读列与已标记删除的行跳过）
+    const cutSelection=(e)=>{
+      const rg=getRange();if(!rg||!options.editable)return;
+      copySelection(e);
+      const batch=[];
+      for(let r=rg.r1;r<=rg.r2;r++)for(let c=rg.c1;c<=rg.c2;c++){const cell=cellAt(r,c);if(!canWrite(cell))continue;applyValue(cell,clipboardValueForType('',cell.def),batch);}
+      pushHistory(batch);
+      new Notice(batch.length?`已剪切 ${batch.length} 个单元格（可 Ctrl/Cmd+Z 撤销）`:'所选区域没有可剪切的单元格');
+    };
     const pasteSelection=(e)=>{
-      if(!options.editable||!state.focus)return;
+      if(!options.editable)return;
+      if(!state.focus){new Notice('请先点击目标单元格，再粘贴');return;}
       const raw=e.clipboardData?.getData('text/plain');if(raw==null)return;
       const matrix=parseClipboardTable(raw);if(!matrix.length)return;
       e.preventDefault();
       let headerMap=null,startRow=0;
       const headerMatches=matrix[0].map(v=>defs.findIndex(d=>d.name===String(v).trim()));
       if(headerMatches.filter(i=>i>=0).length>=2){headerMap=headerMatches;startRow=1;}
-      let changed=0,skipped=0;
+      const batch=[];let skipped=0;
       for(let sr=startRow;sr<matrix.length;sr++){
         const tr=state.focus.r+(sr-startRow);if(tr>=models.length){skipped+=matrix[sr].length;continue;}
         for(let sc=0;sc<matrix[sr].length;sc++){
           const tc=headerMap?(headerMap[sc]??-1):(state.focus.c+sc);if(tc<0||tc>=defs.length){skipped++;continue;}
-          const cell=cellAt(tr,tc);if(!cell||cell.model.status==='removed'||cell.model.readonly?.(cell.def.name)){skipped++;continue;}
-          cell.model.setValue(cell.def.name,clipboardValueForType(matrix[sr][sc],cell.def));renderCell(cell);changed++;
+          const cell=cellAt(tr,tc);if(!canWrite(cell)){skipped++;continue;}
+          applyValue(cell,clipboardValueForType(matrix[sr][sc],cell.def),batch);
         }
       }
-      if(changed)new Notice(`已粘贴 ${changed} 个单元格${skipped?`，跳过 ${skipped} 个不可写/越界单元格`:''}`);
+      pushHistory(batch);
+      if(batch.length)new Notice(`已粘贴 ${batch.length} 个单元格${skipped?`，跳过 ${skipped} 个不可写/越界单元格`:''}（可 Ctrl/Cmd+Z 撤销）`);
+      else new Notice(skipped?'粘贴区域内没有可写入的单元格':'粘贴内容与当前值相同，未发生修改');
     };
     models.forEach((model,r)=>{
       const tr=body.createEl('tr',{cls:`schema-studio-grid-row schema-grid-row-${model.status||'normal'}`});
@@ -3337,8 +3391,18 @@ class SchemaStudioModal extends Modal {
         };
         td.onkeydown=(e)=>{
           if(state.editing)return;
+          // Ctrl/Cmd 组合键在单元格聚焦时也要生效（撤销 / 重做 / 全选 / 剪切）。
+          // 注意：keydown 事件上的 clipboardData 是 undefined，cut 只能"清空区域"，
+          // 剪贴板写入仍由真正的 cut 事件（td.oncut）负责。
+          if((e.ctrlKey||e.metaKey)&&!e.altKey){
+            const key=String(e.key||'').toLowerCase();
+            if(key==='z'){e.preventDefault();e.stopPropagation();if(e.shiftKey)redoEdit();else undoEdit();return;}
+            if(key==='y'){e.preventDefault();e.stopPropagation();redoEdit();return;}
+            if(key==='a'){e.preventDefault();e.stopPropagation();selectAll();return;}
+            if(key==='x'){e.preventDefault();e.stopPropagation();cutSelection(e);return;}
+          }
           if(e.key==='Enter'||e.key==='F2'||(e.key===' '&&String(cell.def.type||'').toLowerCase()==='boolean')){e.preventDefault();beginEdit(cell);return;}
-          if((e.key==='Delete'||e.key==='Backspace')&&options.editable){e.preventDefault();const rg=getRange();if(!rg)return;for(const cc of state.cells)if(cc.r>=rg.r1&&cc.r<=rg.r2&&cc.c>=rg.c1&&cc.c<=rg.c2&&!cc.model.readonly?.(cc.def.name)&&cc.model.status!=='removed'){cc.model.setValue(cc.def.name,clipboardValueForType('',cc.def));renderCell(cc);}return;}
+          if((e.key==='Delete'||e.key==='Backspace')&&options.editable){e.preventDefault();const rg=getRange();if(!rg)return;const batch=[];for(const cc of state.cells)if(cc.r>=rg.r1&&cc.r<=rg.r2&&cc.c>=rg.c1&&cc.c<=rg.c2&&canWrite(cc)){applyValue(cc,clipboardValueForType('',cc.def),batch);}pushHistory(batch);return;}
           if((e.ctrlKey||e.metaKey)&&['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)){
             e.preventDefault();const dx=e.key==='ArrowLeft'?-Math.max(180,wrap.clientWidth*.65):e.key==='ArrowRight'?Math.max(180,wrap.clientWidth*.65):0;const dy=e.key==='ArrowUp'?-Math.max(120,wrap.clientHeight*.65):e.key==='ArrowDown'?Math.max(120,wrap.clientHeight*.65):0;wrap.scrollBy({left:dx,top:dy,behavior:'auto'});return;
           }
@@ -3346,13 +3410,13 @@ class SchemaStudioModal extends Modal {
           if(move){e.preventDefault();selectCell(Math.max(0,Math.min(models.length-1,r+move[0])),Math.max(0,Math.min(defs.length-1,c+move[1])),e.shiftKey&&e.key!=='Tab',true);return;}
           if(options.editable&&e.key.length===1&&!e.metaKey&&!e.ctrlKey&&!e.altKey){e.preventDefault();beginEdit(cell,e.key);}
         };
-        td.oncopy=copySelection;td.onpaste=pasteSelection;
+        td.oncopy=copySelection;td.onpaste=pasteSelection;td.oncut=cutSelection;
       });
     });
-    wrap.oncopy=copySelection;wrap.onpaste=pasteSelection;
+    wrap.oncopy=copySelection;wrap.onpaste=pasteSelection;wrap.oncut=cutSelection;
     wrap.onmouseleave=()=>{state.mouseDown=false;state.mouseMoved=false;};
     const hint=parentEl.createDiv({cls:'schema-studio-grid-hint schema-tools-muted'});
-    hint.setText('点击表头按该列升序，再次点击改为降序，第三次点击清除排序；Shift-点击可追加多列排序。单击选择；双击文本/数值单元格进入编辑并把光标放到点击位置，不会全选；输入后 Enter 确认。Boolean 双击、Enter 或空格直接 true/false 切换。方向键移动单元格焦点；Ctrl/Cmd + 方向键滚动表格窗口。修改会立即显示“旧值删除线 → 新值”，顶部保存编辑提交。拖拽或 Shift 选择区域；Ctrl/Cmd+C 复制；Excel/WPS 区域可直接 Ctrl/Cmd+V 粘贴。');
+    hint.setText('点击表头按该列升序，再次点击改为降序，第三次点击清除排序；Shift-点击可追加多列排序。单击选择；双击文本/数值单元格进入编辑并把光标放到点击位置，不会全选；输入后 Enter 确认。Boolean 双击、Enter 或空格直接 true/false 切换。方向键移动单元格焦点；Ctrl/Cmd + 方向键滚动表格窗口。修改会立即显示“旧值删除线 → 新值”，顶部保存编辑提交。拖拽或 Shift 选择区域；Ctrl/Cmd+C 复制；Excel/WPS 区域可直接 Ctrl/Cmd+V 粘贴；Ctrl/Cmd+X 剪切、Ctrl/Cmd+A 全选区域；Ctrl/Cmd+Z 撤销、Ctrl/Cmd+Shift+Z 或 Ctrl+Y 重做（编辑、粘贴、剪切、清空、布尔切换均可撤销）。');
     return {wrap,table,state};
   }
   async saveDynamicEdits(rows){
