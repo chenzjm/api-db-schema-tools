@@ -588,36 +588,225 @@ function normalizeDirection(value) {
   if (['response','resp','res','响应','响应字段','出参'].includes(s)) return 'Response';
   return '';
 }
+
+// --- XML 报文解析（自 v0.7.11 分支移植）----------------------------------------
+// 手写的一个小解析器：Obsidian 沙箱里没有 DOMParser，也不该为一个导入功能引入第三方依赖。
+// 只支持导入场景需要的子集：元素、属性、文本、CDATA、注释、处理指令、实体。
+// 约定（与对端一致，勿改）：
+//   1. 根元素只是报文容器 —— 解析结果从根的**子元素**开始，根名不出现在字段路径里。
+//   2. 属性写成 `@属性名`（如 `@id`），与子元素区分开。
+//   3. 同名重复元素自动识别为数组（XML 没有数组概念，只能靠重复出现推断）。
+//   4. 元素既有属性又有文本时，文本记为 `_text`（不用 `#text`，避免与 Obsidian 链接锚点冲突）。
+//   5. 类型推断默认关闭：XML 里一切都是字符串，`<age>18</age>` 也保持 "18"。
+//      （推断会伤害「0001」这类有前导零的编码，故默认不推断，可在导入页打开。）
+//   6. `<__schema api="..." direction="..."/>` 作为元信息元素，不参与字段解析。
+function decodeXmlEntities(value) {
+  return String(value == null ? '' : value).replace(/&(#x[0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);/g, (match, body) => {
+    if (body.charAt(0) === '#') {
+      const hex = body.charAt(1) === 'x' || body.charAt(1) === 'X';
+      const code = parseInt(hex ? body.slice(2) : body.slice(1), hex ? 16 : 10);
+      if (!Number.isFinite(code)) return match;
+      try { return String.fromCodePoint(code); } catch { return match; }
+    }
+    const named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+    return Object.prototype.hasOwnProperty.call(named, body) ? named[body] : match;
+  });
+}
+function findXmlTagEnd(text, from) {
+  let quote = null;
+  for (let j = from; j < text.length; j++) {
+    const ch = text[j];
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '>') return j;
+  }
+  return -1;
+}
+function parseXmlTagAttributes(source) {
+  const attrs = {};
+  const re = /([^\s=/>]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+  let m;
+  while ((m = re.exec(source))) attrs[m[1]] = decodeXmlEntities(m[2] ?? m[3] ?? m[4] ?? '');
+  return attrs;
+}
+function parseXmlToTree(source) {
+  const text = String(source == null ? '' : source).replace(/^\uFEFF/, '');
+  const fail = (msg) => { throw new Error(`XML 解析失败：${msg}`); };
+  let i = 0, root = null;
+  const stack = [];
+  while (i < text.length) {
+    const lt = text.indexOf('<', i);
+    if (lt < 0) {
+      const tail = text.slice(i);
+      if (stack.length) stack[stack.length - 1].texts.push(decodeXmlEntities(tail));
+      else if (tail.trim()) fail('根元素之外存在文本内容');
+      break;
+    }
+    if (lt > i) {
+      const chunk = text.slice(i, lt);
+      if (stack.length) stack[stack.length - 1].texts.push(decodeXmlEntities(chunk));
+      else if (chunk.trim()) fail('根元素之外存在文本内容');
+      i = lt;
+    }
+    if (text.startsWith('<!--', i)) {
+      const end = text.indexOf('-->', i + 4);
+      if (end < 0) fail('注释未闭合');
+      i = end + 3; continue;
+    }
+    if (text.startsWith('<![CDATA[', i)) {
+      const end = text.indexOf(']]>', i + 9);
+      if (end < 0) fail('CDATA 区段未闭合');
+      if (stack.length) stack[stack.length - 1].texts.push(text.slice(i + 9, end));
+      i = end + 3; continue;
+    }
+    if (text.startsWith('<?', i)) {
+      const end = text.indexOf('?>', i + 2);
+      if (end < 0) fail('处理指令未闭合');
+      i = end + 2; continue;
+    }
+    if (text.startsWith('<!', i)) {
+      const end = findXmlTagEnd(text, i + 2);
+      if (end < 0) fail('声明未闭合');
+      i = end + 1; continue;
+    }
+    if (text.startsWith('</', i)) {
+      const end = text.indexOf('>', i + 2);
+      if (end < 0) fail('结束标签未闭合');
+      const name = text.slice(i + 2, end).trim();
+      const open = stack.pop();
+      if (!open) fail(`多余的结束标签 </${name}>`);
+      if (open.name !== name) fail(`标签不匹配：<${open.name}> 与 </${name}>`);
+      i = end + 1; continue;
+    }
+    const end = findXmlTagEnd(text, i + 1);
+    if (end < 0) fail('开始标签未闭合');
+    const raw = text.slice(i + 1, end);
+    const selfClosing = /\/\s*$/.test(raw);
+    const body = selfClosing ? raw.replace(/\/\s*$/, '') : raw;
+    const m = /^([^\s/>]+)([\s\S]*)$/.exec(body);
+    if (!m) fail('开始标签缺少名称');
+    const node = { name: m[1], attrs: parseXmlTagAttributes(m[2]), children: [], texts: [] };
+    const parent = stack[stack.length - 1] || null;
+    if (parent) parent.children.push(node);
+    else if (root) fail('存在多个根元素（XML 只允许一个根元素）');
+    else root = node;
+    if (!selfClosing) stack.push(node);
+    i = end + 1;
+  }
+  if (stack.length) fail(`标签未闭合：<${stack[stack.length - 1].name}>`);
+  if (!root) fail('未找到根元素');
+  return root;
+}
+function normalizeXmlScalar(value, inferTypes) {
+  const text = String(value == null ? '' : value).trim();
+  if (!inferTypes || text === '') return text;
+  if (text === 'true') return true;
+  if (text === 'false') return false;
+  if (/^[+-]?\d+$/.test(text)) {
+    const num = Number(text);
+    return Number.isSafeInteger(num) ? num : text;
+  }
+  if (/^[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(text)) {
+    const num = Number(text);
+    return Number.isFinite(num) ? num : text;
+  }
+  return text;
+}
+function xmlNodeToValue(node, inferTypes) {
+  const record = {};
+  for (const [k, v] of Object.entries(node.attrs || {})) record[`@${k}`] = v;
+  for (const child of node.children || []) {
+    const value = xmlNodeToValue(child, inferTypes);
+    if (Object.prototype.hasOwnProperty.call(record, child.name)) {
+      if (Array.isArray(record[child.name])) record[child.name].push(value);
+      else record[child.name] = [record[child.name], value];
+    } else record[child.name] = value;
+  }
+  const text = (node.texts || []).join('').trim();
+  const keys = Object.keys(record);
+  if (!keys.length) return normalizeXmlScalar(text, inferTypes);
+  if (text) record['_text'] = normalizeXmlScalar(text, inferTypes);
+  return record;
+}
+function parseXmlPayload(source, options = {}) {
+  const inferTypes = !!(options && options.inferTypes);
+  const root = parseXmlToTree(source);
+  let metaEl = null;
+  for (const child of root.children) {
+    if (child.name === '__schema' || child.name === '_schema') { metaEl = child; break; }
+  }
+  let meta = null;
+  if (metaEl) { meta = {}; for (const [k, v] of Object.entries(metaEl.attrs || {})) meta[k] = v; }
+  const data = {};
+  for (const child of root.children) {
+    if (child === metaEl) continue;
+    const value = xmlNodeToValue(child, inferTypes);
+    if (Object.prototype.hasOwnProperty.call(data, child.name)) {
+      if (Array.isArray(data[child.name])) data[child.name].push(value);
+      else data[child.name] = [data[child.name], value];
+    } else data[child.name] = value;
+  }
+  return { data, meta, rootName: root.name };
+}
+function looksLikeXmlText(text) {
+  const s = String(text == null ? '' : text).trim();
+  return s.charAt(0) === '<';
+}
 function parseJsonFilenameTarget(filename) {
-  const base = String(filename || '').replace(/\.json$/i,'').trim();
+  // 扩展名同时认 json 与 xml —— 导入页现在接受两种报文，文件名路由规则保持一致
+  const base = String(filename || '').replace(/\.(?:json|xml)$/i,'').trim();
   const m = base.match(/^(.+?)[._\-\s]+(request|response|req|resp|res|请求|响应|入参|出参)$/i);
   if (!m) return null;
   const direction = normalizeDirection(m[2]);
   return direction ? { apiName: m[1].trim(), direction } : null;
 }
+// 导入单元解析：JSON 与 XML 走同一入口。判据是「文件名以 .xml 结尾」或「内容以 < 开头」。
+// 返回里多带两项：`sourceFormat`（json / xml，决定示例代码块的语言标记）与 `sample`
+// （剥掉 __schema 之后的原始报文，用于回写接口文档的「## 请求示例 / ## 响应示例」）。
 function extractJsonImportUnit(text, filename='', fallback={}) {
-  const parsed = JSON.parse(text);
-  let data = parsed;
-  let meta = null;
-  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-    if (parsed.__schema && typeof parsed.__schema === 'object' && !Array.isArray(parsed.__schema)) meta = parsed.__schema;
-    else if (parsed._schema && typeof parsed._schema === 'object' && !Array.isArray(parsed._schema)) meta = parsed._schema;
+  const raw = String(text == null ? '' : text);
+  if (!raw.trim()) throw new Error('导入内容为空：请粘贴 JSON / XML 字符串，或选择文件');
+  const isXml = /\.xml$/i.test(String(filename || '')) || looksLikeXmlText(raw);
+  let data, meta = null;
+  if (isXml) {
+    // 类型推断默认关闭：XML 里一切都是字符串，`<code>0001</code>` 不该被读成数字 1
+    const xml = parseXmlPayload(raw, { inferTypes: !!fallback.xmlInferTypes });
+    data = xml.data;
+    meta = xml.meta;
+  } else {
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch (e) { throw new Error(`JSON 解析失败：${e.message}。若内容其实是 XML，请确认它以 < 开头，或将文件名改为 .xml`); }
+    data = parsed;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      if (parsed.__schema && typeof parsed.__schema === 'object' && !Array.isArray(parsed.__schema)) meta = parsed.__schema;
+      else if (parsed._schema && typeof parsed._schema === 'object' && !Array.isArray(parsed._schema)) meta = parsed._schema;
+    }
   }
+  const originalData = data;
   const fromName = parseJsonFilenameTarget(filename);
   const apiName = String(meta?.api || meta?.apiName || meta?.interface || fromName?.apiName || fallback.apiName || '').trim();
   const direction = normalizeDirection(meta?.direction || fromName?.direction || fallback.direction);
   if (meta) {
     const key = String(meta.dataKey || meta.payloadKey || '').trim();
-    if (key && Object.prototype.hasOwnProperty.call(parsed, key)) data = parsed[key];
-    else if (Object.prototype.hasOwnProperty.call(parsed, 'payload')) data = parsed.payload;
-    else if (Object.prototype.hasOwnProperty.call(parsed, 'body')) data = parsed.body;
-    else if (Object.prototype.hasOwnProperty.call(parsed, 'data')) data = parsed.data;
-    else {
-      data = Object.fromEntries(Object.entries(parsed).filter(([k]) => k !== '__schema' && k !== '_schema'));
-    }
+    if (key && Object.prototype.hasOwnProperty.call(data, key)) data = data[key];
+    else if (Object.prototype.hasOwnProperty.call(data, 'payload')) data = data.payload;
+    else if (Object.prototype.hasOwnProperty.call(data, 'body')) data = data.body;
+    else if (Object.prototype.hasOwnProperty.call(data, 'data')) data = data.data;
+    // XML 的 __schema 是根下的一个元素，剥根时已经跳过，不必再过滤
+    else if (!isXml) data = Object.fromEntries(Object.entries(data).filter(([k]) => k !== '__schema' && k !== '_schema'));
   }
-  if (!apiName || !direction) throw new Error(`无法确定导入目标：${filename || 'JSON 字符串'}。请使用“接口名.Request.json / 接口名.Response.json”，或在内容中提供 __schema.api + __schema.direction。`);
-  return { apiName, direction, data, filename: filename || 'JSON 字符串' };
+  // 原始样例：只剥掉 __schema 元信息，其余原样保留 —— 示例给的是报文的真实形态
+  let sample = '';
+  if (isXml) sample = raw.trim();
+  else if (originalData && typeof originalData === 'object') {
+    const clone = Array.isArray(originalData) ? originalData
+      : Object.fromEntries(Object.entries(originalData).filter(([k]) => k !== '__schema' && k !== '_schema'));
+    try { sample = JSON.stringify(clone, null, 2); } catch (_e) { sample = ''; }
+  }
+  const sourceLabel = filename || (isXml ? 'XML 字符串' : 'JSON 字符串');
+  if (!apiName || !direction) throw new Error(`无法确定导入目标：${sourceLabel}。请使用“接口名.Request.json / 接口名.Request.xml”，或在内容中提供 __schema.api + __schema.direction。`);
+  return { apiName, direction, data, filename: sourceLabel, sourceFormat: isXml ? 'xml' : 'json', sample };
 }
 function diffValue(v) {
   if (v === undefined) return '—';
@@ -3188,8 +3377,8 @@ class SchemaStudioModal extends Modal {
 
   renderPageHeader(title,subtitle=''){this.renderHeader(title,subtitle,[{text:'返回',onclick:()=>{this.page='browse';this.importState=null;this.render();}}]);}
   renderMultiFileChooser(kind,state,key){
-    const text=kind==='json'?'选择 JSON 文件（可多选）':kind==='xml'?'选择 xxl-job XML 文件（可多选）':'选择 SQL/DDL 文件（可多选）';
-    const accept=kind==='json'?'.json,application/json':kind==='xml'?'.xml,text/xml,application/xml':'.sql,.ddl,text/plain,application/sql';
+    const text=kind==='json'?'选择 JSON / XML 文件（可多选）':kind==='xml'?'选择 xxl-job XML 文件（可多选）':'选择 SQL/DDL 文件（可多选）';
+    const accept=kind==='json'?'.json,.xml,application/json,text/xml,application/xml':kind==='xml'?'.xml,text/xml,application/xml':'.sql,.ddl,text/plain,application/sql';
     const row=this.mainEl.createDiv({cls:'schema-studio-source-row'});const label=row.createEl('label',{cls:'schema-studio-file-label'});label.createSpan({text});const input=label.createEl('input',{type:'file',attr:{accept,multiple:'multiple'}});
     input.onchange=async()=>{const files=[...(input.files||[])];const loaded=[];for(const f of files){try{loaded.push({name:f.name,text:await f.text()});}catch(e){new Notice(`读取 ${f.name} 失败：${e.message}`);}}state[key]=loaded;this.render();};
     row.createDiv({text:'可一次选择多个文件',cls:'schema-tools-muted'});if((state[key]||[]).length){const box=this.mainEl.createDiv({cls:'schema-studio-selected-files'});box.createDiv({text:`已选择 ${state[key].length} 个文件`,cls:'schema-tools-label'});for(const f of state[key])box.createDiv({text:f.name,cls:'schema-studio-file-chip'});}
@@ -3333,10 +3522,10 @@ class SchemaStudioModal extends Modal {
   }
 
   renderJsonImport(){
-    const state=this.importState||{apiName:'',direction:'Request',jsonText:'',jsonFiles:[]};this.importState=state;this.renderPageHeader('JSON → 接口 Schema','支持 JSON 字符串、单文件和批量文件；批量文件按文件名或 __schema 元信息自动路由。');
-    this.mainEl.createDiv({text:'批量命名示例：创建订单.Request.json、创建订单-Response.json。也可以在 JSON 中加入 __schema: { api, direction }，payload/body/data 作为实际样例。导入器只覆盖可推断的结构属性，Fileclass 中的其他自定义属性会保留。',cls:'schema-tools-callout'});
+    const state=this.importState||{apiName:'',direction:'Request',jsonText:'',jsonFiles:[],xmlInferTypes:false};this.importState=state;this.renderPageHeader('JSON / XML → 接口 Schema','支持 JSON 与 XML 字符串、单文件和批量文件；批量文件按文件名或 __schema 元信息自动路由。');
+    this.mainEl.createDiv({text:'批量命名示例：创建订单.Request.json、创建订单-Response.xml。也可以在内容中加入 __schema: { api, direction }（XML 用 <__schema api="创建订单" direction="Request"/> 元素），payload/body/data 作为实际样例。XML 解析：剥离根元素（根只作报文容器）；属性写成 @属性名（如 @id）；同名重复元素自动识别为数组；元素既有属性又有文本时文本记为 _text（不用 #text，避免与 Obsidian 链接锚点冲突）；命名空间前缀保留原样。导入的原始报文会逐字节写进接口文档的「## 请求示例 / ## 响应示例」代码块（文档里没有该章节则不写）。导入器只覆盖可推断的结构属性，Fileclass 中的其他自定义属性会保留。',cls:'schema-tools-callout'});
     this.renderMultiFileChooser('json',state,'jsonFiles');
-    const form=this.mainEl.createDiv({cls:'schema-studio-form'});new Setting(form).setName('JSON 字符串的接口名称').setDesc('仅用于下方粘贴的 JSON，或单个无法从文件名识别的文件。').addText(t=>t.setValue(state.apiName||'').onChange(v=>state.apiName=v.trim()));new Setting(form).setName('方向').addDropdown(d=>d.addOptions({Request:'Request',Response:'Response'}).setValue(state.direction||'Request').onChange(v=>state.direction=v));
+    const form=this.mainEl.createDiv({cls:'schema-studio-form'});new Setting(form).setName('JSON 字符串的接口名称').setDesc('仅用于下方粘贴的 JSON，或单个无法从文件名识别的文件。').addText(t=>t.setValue(state.apiName||'').onChange(v=>state.apiName=v.trim()));new Setting(form).setName('方向').addDropdown(d=>d.addOptions({Request:'Request',Response:'Response'}).setValue(state.direction||'Request').onChange(v=>state.direction=v));new Setting(form).setName('XML 类型推断').setDesc('默认关闭：XML 里一切都是字符串。打开后 <age>18</age> 会读成数字、<flag>true</flag> 读成布尔 —— 但「0001」这类有前导零的编码会被吞掉前导零，按需开启。').addToggle(t=>t.setValue(!!state.xmlInferTypes).onChange(v=>state.xmlInferTypes=v));
     this.mainEl.createDiv({text:'JSON 字符串（可选）',cls:'schema-tools-label'});const ta=this.mainEl.createEl('textarea',{cls:'schema-tools-textarea',attr:{placeholder:'{\n  "mobile": "13800000000"\n}'}});ta.value=state.jsonText||'';ta.oninput=()=>state.jsonText=ta.value;
     const actions=this.mainEl.createDiv({cls:'schema-tools-actions'});const analyze=actions.createEl('button',{text:'分析全部并查看 Diff',cls:'mod-cta'});analyze.onclick=()=>this.analyzeJson(state);
   }
@@ -3345,10 +3534,11 @@ class SchemaStudioModal extends Modal {
     const incoming=inferred.map(struct=>{const old=exMap.get(struct.path);const base=old?stripCacheKeys(old.fm):Object.assign({},defaults);for(const [key,value] of Object.entries(Object.assign({},struct,{direction:unit.direction})))setSchemaValue(base,'api',key,value);base.key=struct.path;return base;});
     const existingCanonical=existing.map(x=>Object.assign({key:x.path},canonicalSchemaRecord('api',x.fm)));
     const incomingCanonical=incoming.map(x=>Object.assign({key:x.key},canonicalSchemaRecord('api',x)));
-    const diff=core.diffRecords(existingCanonical,incomingCanonical,API_IMPORT_MANAGED_KEYS);return {apiName:unit.apiName,direction:unit.direction,sourceName:unit.filename,incoming,existing,diff};
+    const diff=core.diffRecords(existingCanonical,incomingCanonical,API_IMPORT_MANAGED_KEYS);return {apiName:unit.apiName,direction:unit.direction,sourceName:unit.filename,sourceFormat:unit.sourceFormat||'json',sample:unit.sample||'',incoming,existing,diff};
   }
   analyzeJson(state){
-    const units=[];const files=state.jsonFiles||[];try{for(const f of files)units.push(extractJsonImportUnit(f.text,f.name,files.length===1?{apiName:state.apiName,direction:state.direction}:{}));if((state.jsonText||'').trim())units.push(extractJsonImportUnit(state.jsonText,'',{apiName:state.apiName,direction:state.direction}));}catch(e){new Notice(`JSON 导入映射失败：${e.message}`);return;}if(!units.length){new Notice('请选择 JSON 文件或粘贴 JSON 字符串');return;}
+    const fb={apiName:state.apiName,direction:state.direction,xmlInferTypes:!!state.xmlInferTypes};
+    const units=[];const files=state.jsonFiles||[];try{for(const f of files)units.push(extractJsonImportUnit(f.text,f.name,files.length===1?fb:{xmlInferTypes:!!state.xmlInferTypes}));if((state.jsonText||'').trim())units.push(extractJsonImportUnit(state.jsonText,'',fb));}catch(e){new Notice(`导入映射失败：${e.message}`);return;}if(!units.length){new Notice('请选择文件或粘贴 JSON / XML 字符串');return;}
     const seen=new Set();for(const u of units){const k=`${u.apiName}\u0000${u.direction}`;if(seen.has(k)){new Notice(`批量导入中目标重复：${u.apiName} / ${u.direction}`);return;}seen.add(k);}
     state.analysis=units.map(u=>this.buildApiAnalysis(u));this.page='json-diff';this.render();
   }
@@ -3388,6 +3578,17 @@ class SchemaStudioModal extends Modal {
       this.renderDataGrid(models,defs,{domain:'api',editable:true,showStatus:true});
     }
   }
+  // 把导入的原始报文写进接口文档的占位代码块（Request → ## 请求示例，Response → ## 响应示例）。
+  // 文档里没有对应章节或代码块时**不新建** —— 宁可不写，也不往手写文档里凭空插章节。
+  async syncDocCodeBlock(docPath,heading,lang,content){
+    const file=this.app.vault.getAbstractFileByPath(docPath);
+    if(!file||!String(content||'').trim())return false;
+    const text=String(await this.app.vault.read(file));
+    const next=upsertSectionCodeBlock(text,heading,lang,content);
+    if(next===text)return false;
+    await this.app.vault.modify(file,next);
+    return true;
+  }
   async applyOneApiAnalysis(a){
     const now=new Date().toISOString(),folder=normalizePath(this.plugin.settings.apiFieldsFolder);await ensureFolder(this.app,folder);
     // 接口文档优先落在现有字段已指向的位置；只有确实没有可依据的位置时才用设置里的目录。
@@ -3395,6 +3596,11 @@ class SchemaStudioModal extends Modal {
     await ensureFolder(this.app,apiDocPath.split('/').slice(0,-1).join('/'));
     const apiLink=`[[${apiDocPath.replace(/\.md$/,'')}]]`;
     if(!this.app.vault.getAbstractFileByPath(apiDocPath))await this.app.vault.create(apiDocPath,`# ${a.apiName}\n\n## Request\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Request]]\n\n## Response\n\n![[${this.plugin.settings.apiBaseName}#当前接口 Response]]\n`);
+    // 导入的原始报文写进「## 请求示例 / ## 响应示例」（文档里没这个章节就不写，不去凭空插章节）
+    const sampleHeading=a.direction==='Response'?'响应示例':'请求示例';
+    const sampleLang=a.sourceFormat==='xml'?'xml':'json';
+    const wroteSample=a.sample?await this.syncDocCodeBlock(apiDocPath,sampleHeading,sampleLang,a.sample):false;
+    if(a.sample&&!wroteSample)new Notice(`「${a.apiName}」文档里没有「## ${sampleHeading}」占位代码块，原始报文未写入（字段已正常导入）。`);
     const exMap=new Map(a.existing.map(x=>[x.path,x]));
     // 兜底：按文件路径匹配，避免字段名丢失时把已存在的文档当成新建、因重名抛错中断整批导入
     const exPathMap=new Map(a.existing.map(x=>[normalizePath(x.filePath),x]));
@@ -3631,5 +3837,5 @@ function countStatuses(diff){const c={added:0,changed:0,unchanged:0,removed:0};f
 function labelStatus(s){return {added:'新增',changed:'变化',unchanged:'未变',removed:'消失'}[s]||s;}
 function changeSummary(d){if(!d||d.status!=='changed')return '';return '变更：'+d.changes.map(k=>`${k} ${JSON.stringify(d.before?.[k]??'')} → ${JSON.stringify(d.after?.[k]??'')}`).join('；');}
 
-SchemaToolsPlugin._test = { core, DDL_DIALECTS, DEFAULTS, xxlLoaded: () => !!xxl, xxlBoot: bootXxl, xxlAbsDir: xxlAbsolutePluginDir, xxlLog: () => xxlLoadLog, XXL_DIRS, XXL_CLASS_BY_LEVEL, XXL_STATE_FILENAME, xxlSettings, xxlStatePathFor, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell, escapeRe, upsertSectionCodeBlock, readSectionCodeBlock, detectDdlDialect, splitTopLevelRanges, scanCreateTable, renderColumnDef, buildDdlFromColumns };
+SchemaToolsPlugin._test = { core, DDL_DIALECTS, DEFAULTS, xxlLoaded: () => !!xxl, xxlBoot: bootXxl, xxlAbsDir: xxlAbsolutePluginDir, xxlLog: () => xxlLoadLog, XXL_DIRS, XXL_CLASS_BY_LEVEL, XXL_STATE_FILENAME, xxlSettings, xxlStatePathFor, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell, decodeXmlEntities, parseXmlToTree, parseXmlPayload, xmlNodeToValue, normalizeXmlScalar, looksLikeXmlText, escapeRe, upsertSectionCodeBlock, readSectionCodeBlock, detectDdlDialect, splitTopLevelRanges, scanCreateTable, renderColumnDef, buildDdlFromColumns };
 module.exports = SchemaToolsPlugin;
