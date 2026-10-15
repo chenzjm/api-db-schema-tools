@@ -357,6 +357,13 @@ const DEFAULTS = {
   dbBaseName: 'DbColumns.base',
   // 新建表文档时套用的模板；留空则回退到内置的最小结构
   dbDocTemplate: '_template/业务模板/db-数据库-shuju/db-数据库-shuju.md',
+  // --- 字段表 → 表文档「## 建表语句」实时同步（自 v0.7.22 移植） ---
+  // 默认关闭：这条链路会改写表文档里的 SQL（虽然是补丁式、幂等的）。
+  // 建议先用命令面板在单张表上跑一次，确认产物符合预期后再打开自动同步。
+  syncTableDocFromFields: false,
+  autoSyncDebounceMs: 1200,
+  // 重建时用的方言：auto = 按 SQL 特征猜（本库默认落到 Oracle）
+  autoSyncDialect: 'auto',
   prioritizeInlineSuggest: true,
   // --- xxl-job XML 导入（子模块 xxljob-flow-atlas） ---
   xxljobDocsFolder: '8.xxljob',
@@ -980,6 +987,33 @@ class SchemaToolsPlugin extends Plugin {
       name: '退出体验样例并恢复插件配置',
       callback: () => new DemoRestoreModal(this.app, this).open(),
     });
+
+    // ★ 字段表 → 表文档「## 建表语句」实时同步（默认关闭，见设置项）。
+    //   三个事件都听：新增列、改列、删列都会影响建表语句。
+    this._fieldTimers = new Map();
+    const onFieldChange = (file) => this.onFieldFileModified(file);
+    this.registerEvent(this.app.vault.on('modify', onFieldChange));
+    this.registerEvent(this.app.vault.on('create', onFieldChange));
+    this.registerEvent(this.app.vault.on('delete', onFieldChange));
+    this.register(() => {
+      for (const t of this._fieldTimers.values()) clearTimeout(t);
+      this._fieldTimers.clear();
+    });
+    this.addCommand({
+      id: 'sync-fields-to-table-doc',
+      name: '按字段表更新当前表的建表语句',
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || !this.isTableDocPath(file.path)) return false;
+        if (!checking) this.runFieldsToTableDocSync(file.path, { manual: true });
+        return true;
+      },
+    });
+    this.addCommand({
+      id: 'sync-all-fields-to-table-docs',
+      name: '同步全部字段表到各表的建表语句',
+      callback: () => this.syncAllFieldsToTableDocs(),
+    });
   }
   async saveSettings() { await this.saveData(this.settings); }
 
@@ -1218,6 +1252,166 @@ class SchemaToolsPlugin extends Plugin {
       };
     }).filter(x => x.table && x.name);
   }
+
+  // ==== 字段表 → 表文档「## 建表语句」（自 v0.7.22 移植） ========================
+  // 表文档判定：在 dbDocsFolder 子树内，且不与 dbColumnsFolder 重叠（重叠时分不清源与产物）
+  isTableDocPath(path) {
+    const p = normalizePath(String(path || ''));
+    if (!p || !/\.md$/i.test(p)) return false;
+    const inside = (folder) => { const f = normalizePath(String(folder || '')); return !!f && (p === f || p.startsWith(f + '/')); };
+    return inside(this.settings.dbDocsFolder) && !inside(this.settings.dbColumnsFolder);
+  }
+  isFieldFilePath(path) {
+    const p = normalizePath(String(path || ''));
+    if (!p || !/\.md$/i.test(p)) return false;
+    const f = normalizePath(String(this.settings.dbColumnsFolder || ''));
+    return !!f && (p === f || p.startsWith(f + '/'));
+  }
+  // 插件自己刚写过这份表文档 → 没有用户新意图，跳过；否则会与「建表语句 → 字段表」来回抖
+  markDocSelfWrite(path, text) {
+    if (!this._docSelfWrites) this._docSelfWrites = new Map();
+    this._docSelfWrites.set(normalizePath(path), String(text == null ? '' : text));
+  }
+  isDocSelfWrite(path, text) {
+    const key = normalizePath(path);
+    const rec = this._docSelfWrites && this._docSelfWrites.get(key);
+    if (rec === undefined) return false;
+    if (rec === String(text == null ? '' : text)) return true;
+    this._docSelfWrites.delete(key);
+    return false;
+  }
+  // 由列文件反查所属表文档：优先读 frontmatter 的「数据表」链接，其次按文件名前缀在表文档目录里找
+  async resolveTableDocForFieldFile(fieldPath) {
+    const p = normalizePath(fieldPath);
+    const file = this.app.vault.getAbstractFileByPath(p);
+    if (file) {
+      const fm = stripCacheKeys(this.app.metadataCache.getFileCache(file)?.frontmatter || {});
+      const link = fmLinkPath(schemaValue(fm, 'db', 'table'));
+      if (link) return link.replace(/\.md$/i, '') + '.md';
+    }
+    const tableName = basenameNoExt(p).split('__')[0];
+    if (!tableName) return null;
+    const prefix = normalizePath(String(this.settings.dbDocsFolder || '')) + '/';
+    const hit = this.app.vault.getMarkdownFiles().find((f) => f.path.startsWith(prefix) && basenameNoExt(f.path) === tableName && this.isTableDocPath(f.path));
+    return hit ? hit.path : null;
+  }
+  onFieldFileModified(file) {
+    if (!this.settings.syncTableDocFromFields) return;
+    if (!this.isFieldFilePath(file && file.path)) return;
+    if (!this._fieldTimers) this._fieldTimers = new Map();
+    const p = normalizePath(file.path);
+    const prev = this._fieldTimers.get(p);
+    if (prev) clearTimeout(prev);
+    // 防抖：属性面板里连续改几个属性只同步一次
+    this._fieldTimers.set(p, setTimeout(() => {
+      this._fieldTimers.delete(p);
+      this.runFieldsToTableDocSync(p, { manual: false });
+    }, Math.max(300, Number(this.settings.autoSyncDebounceMs) || 1200)));
+  }
+  // 核心：以字段表为源，补丁式重建表文档「## 建表语句」（幂等，见 buildDdlFromColumns）
+  async syncFieldsToTableDoc(docPath) {
+    const path = normalizePath(docPath);
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file) return { ok: false, reason: 'not-found' };
+    const text = String(await this.app.vault.read(file));
+    const sql = readSectionCodeBlock(text, '建表语句');
+    // 占位注释（`-- 待补充`）与空代码块不算 DDL，一律跳过
+    if (!sql.trim() || !/create\s+table/i.test(sql)) return { ok: false, reason: 'empty' };
+    const table = basenameNoExt(path);
+    // 「疑似删除」的列不参与重建 —— 否则删除标记形同失效（重建会把它加回 SQL）
+    const columns = this.scanDbColumns().filter(x => x.table === table && !x.schema_orphaned)
+      .map(x => ({
+        name: x.name, data_type: x.data_type, nullable: x.nullable !== false,
+        primary_key: !!x.primary_key, indexed: !!x.indexed,
+        default_value: x.default_value == null ? '' : String(x.default_value),
+        desc: String(schemaValue(x.fm || {}, 'db', 'description') || ''),
+      }));
+    if (!columns.length) return { ok: false, reason: 'no-columns', table };
+    const wanted = String(this.settings.autoSyncDialect || 'auto');
+    const dialectId = (wanted === 'auto' || !DDL_DIALECTS[wanted]) ? detectDdlDialect(sql) : wanted;
+    const r = buildDdlFromColumns({ sql, table, columns, dialect: dialectId });
+    if (!r.ok) return { ok: false, reason: r.reason, table };
+    // 安全闸：一次要删掉的列超过一半，多半是「列文件只建了一部分」而不是真要删列，宁可不改
+    let originCount = 0;
+    try { const t = parseDdlWithDialect(sql, dialectId).find(x => String(x.table || '').toLowerCase() === table.toLowerCase()); originCount = t ? t.columns.length : 0; } catch (e) { /* 解析失败时按 0 处理，等于不放行 */ }
+    const maxDrop = Math.max(1, Math.floor(originCount * 0.5));
+    if (r.stats.removed > maxDrop) return { ok: false, reason: 'too-many-removed', table, stats: r.stats, removed: r.stats.removed, existing: originCount };
+    if (!r.changed) return { ok: true, noop: true, table, stats: r.stats };
+    const next = upsertSectionCodeBlock(text, '建表语句', 'sql', r.sql);
+    if (next !== text) {
+      await this.app.vault.modify(file, next);
+      this.markDocSelfWrite(path, next);
+    }
+    return { ok: true, table, stats: r.stats };
+  }
+  async runFieldsToTableDocSync(path, options = {}) {
+    const manual = !!(options && options.manual);
+    const name = basenameNoExt(path);
+    try {
+      let docPath = null;
+      if (this.isTableDocPath(path)) {
+        docPath = normalizePath(path);            // 用户在表文档里手动触发：不查自写抑制
+      } else {
+        docPath = await this.resolveTableDocForFieldFile(path);
+      }
+      if (!docPath || !this.isTableDocPath(docPath)) {
+        if (manual) new Notice(`「${name}」没有找到所属的表文档，未同步。`);
+        return { ok: false, reason: 'no-table-doc' };
+      }
+      const r = await this.syncFieldsToTableDoc(docPath);
+      if (!r.ok) {
+        if (manual) {
+          const docName = basenameNoExt(docPath);
+          const why = r.reason === 'empty' ? '表文档里没有可用的「## 建表语句」（占位注释不算）'
+            : r.reason === 'not-found' ? '表文档不存在'
+            : r.reason === 'no-columns' ? `「${r.table || docName}」没有对应的列文件`
+            : r.reason === 'parse-error' ? '建表语句解析失败（不是可识别的 CREATE TABLE）'
+            : r.reason === 'no-create-table' ? '建表语句里找不到这张表的 CREATE TABLE'
+            : r.reason === 'too-many-removed' ? `字段表只覆盖 ${r.existing - r.removed} 列，建表语句有 ${r.existing} 列，疑似列文件不完整，已跳过`
+            : r.reason;
+          new Notice(`「${docName}」未同步：${why}`);
+        } else if (r.reason === 'too-many-removed') {
+          new Notice(`「${basenameNoExt(docPath)}」建表语句有 ${r.existing} 列、字段表只覆盖 ${r.existing - r.removed} 列，疑似列文件不完整，已跳过本次自动同步。`);
+        }
+        return r;
+      }
+      if (r.noop) {
+        if (manual) new Notice(`「${r.table}」建表语句已与字段表一致，无需更新。`);
+        return r;
+      }
+      const s = r.stats || {}, bits = [];
+      if (s.added) bits.push(`新增列 ${s.added}`);
+      if (s.changed) bits.push(`更新列 ${s.changed}`);
+      if (s.removed) bits.push(`移除列 ${s.removed}`);
+      if (s.primaryKey === 'added') bits.push('补主键');
+      if (s.primaryKey === 'updated') bits.push('更新主键');
+      if (s.primaryKey === 'removed') bits.push('移除主键');
+      if (s.commentsAdded) bits.push(`补注释 ${s.commentsAdded}`);
+      if (s.indexesAdded) bits.push(`补索引 ${s.indexesAdded}`);
+      new Notice(`「${r.table}」建表语句已按字段表更新：${bits.length ? bits.join(' · ') : '已重建'}`);
+      return r;
+    } catch (e) {
+      console.error('[Schema Studio] 字段表同步建表语句失败：', path, e);
+      if (manual) new Notice(`「${name}」同步失败：${(e && e.message) || e}`);
+      return { ok: false, reason: 'exception', message: (e && e.message) || String(e) };
+    }
+  }
+  async syncAllFieldsToTableDocs() {
+    const prefix = normalizePath(String(this.settings.dbDocsFolder || '')) + '/';
+    const docs = this.app.vault.getMarkdownFiles().filter((f) => f.path.startsWith(prefix) && this.isTableDocPath(f.path));
+    if (!docs.length) { new Notice(`「${this.settings.dbDocsFolder}」下没有找到表文档。`); return; }
+    let synced = 0, skipped = 0;
+    for (const f of docs) {
+      try {
+        const r = await this.syncFieldsToTableDoc(f.path);
+        if (r.ok && !r.noop) synced++; else skipped++;
+      } catch (e) {
+        console.error('[Schema Studio] 批量同步建表语句失败：', f.path, e);
+        skipped++;
+      }
+    }
+    new Notice(`字段 → 建表语句 同步完成：${synced} 个已更新 · ${skipped} 个无变化或已跳过（共 ${docs.length} 个表文档）`);
+  }
 }
 
 class SchemaToolsSettingTab extends PluginSettingTab {
@@ -1239,6 +1433,26 @@ class SchemaToolsSettingTab extends PluginSettingTab {
       .setDesc('DDL 导入或手工新建数据库表时，套用这个模板生成表文档：表中文名取 DDL 的 COMMENT ON TABLE，数据库Schema、表名、建表语句自动填。留空则使用内置的最小结构。')
       .addText(t => t.setValue(this.plugin.settings.dbDocTemplate || '').onChange(async v => {
         this.plugin.settings.dbDocTemplate = v.trim(); await this.plugin.saveSettings();
+      }));
+    containerEl.createEl('h3', { text: '字段表 ⇄ 建表语句 同步' });
+    new Setting(containerEl)
+      .setName('字段表属性变化实时更新建表语句')
+      .setDesc('改 _data/db-columns 里列文件的属性（数据类型 / 可为空 / 主键 / 索引 / 说明）后，自动重建表文档「## 建表语句」。补丁式重建：只改真不一致的地方，没变化时不落盘；注释只补不改、索引只补不删。默认关闭，建议先用下面的命令在单张表上验证。')
+      .addToggle(t => t.setValue(!!this.plugin.settings.syncTableDocFromFields).onChange(async v => {
+        this.plugin.settings.syncTableDocFromFields = v; await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl)
+      .setName('重建建表语句的方言')
+      .setDesc('auto 按 SQL 特征自动判断（本库默认落到 Oracle）。')
+      .addDropdown(d => d.addOption('auto', 'auto（自动判断）').addOption('oracle', 'Oracle').addOption('mysql', 'MySQL')
+        .setValue(this.plugin.settings.autoSyncDialect || 'auto').onChange(async v => {
+          this.plugin.settings.autoSyncDialect = v; await this.plugin.saveSettings();
+        }));
+    new Setting(containerEl)
+      .setName('自动同步防抖（毫秒）')
+      .setDesc('连续改几个属性只会同步一次。')
+      .addText(t => t.setValue(String(this.plugin.settings.autoSyncDebounceMs || 1200)).onChange(async v => {
+        this.plugin.settings.autoSyncDebounceMs = Math.max(300, Number(String(v).trim()) || 1200); await this.plugin.saveSettings();
       }));
     containerEl.createEl('h3', { text: 'xxl-job XML 导入' });
     if (!xxl) {
