@@ -111,20 +111,32 @@
 .schema-studio-diff-after { background:color-mix(in srgb, var(--text-success) 6%, transparent); }
 .schema-status-removed td:first-child { color:var(--text-error); font-weight:600; }
 
-/* xxl-job 域：浏览页属性预览卡片 + 导入清单改动点 */
+/* xxl-job 域：浏览页属性预览卡片 + 导入清单阅读模式预览 */
 .schema-studio-xxl-list { display:flex; flex-direction:column; gap:8px; }
 .schema-studio-xxl-card { border:1px solid var(--background-modifier-border); border-radius:6px; padding:8px 10px; background:var(--background-primary); }
 .schema-studio-xxl-card-title { cursor:pointer; }
 .schema-studio-xxl-card-title:hover { background:var(--interactive-accent); color:var(--text-on-accent); }
-.schema-studio-xxl-preview-body { margin:6px 0 0; white-space:pre-wrap; word-break:break-all; font-family:var(--font-monospace); font-size:var(--font-ui-smaller); color:var(--text-muted); max-height:220px; overflow:auto; }
-.schema-studio-xxl-changes { margin:0 0 6px; }
-.schema-studio-xxl-change-row { display:flex; flex-wrap:wrap; align-items:baseline; gap:6px; padding:2px 0; font-size:var(--font-ui-smaller); }
-.schema-studio-xxl-change-tag { flex:none; min-width:2.4em; text-align:center; border-radius:4px; padding:0 4px; font-size:var(--font-ui-smallest); font-weight:600; }
-.schema-studio-xxl-change-tag.schema-status-changed { color:var(--text-warning); }
-.schema-studio-xxl-change-tag.schema-status-added { color:var(--text-success); }
-.schema-studio-xxl-change-tag.schema-status-removed { color:var(--text-error); }
-.schema-studio-xxl-change-del { background:color-mix(in srgb, var(--text-error) 8%, transparent); text-decoration:line-through; }
-.schema-studio-xxl-change-ins { background:color-mix(in srgb, var(--text-success) 8%, transparent); text-decoration:none; }
+/* 阅读模式预览：不再用 <pre> 展示 YAML 源码。
+   overflow-x:hidden 是关键——超长行（任务参数 JSON）横向溢出会拖出一条深色 overlay 滚动条。 */
+.schema-studio-xxl-preview {
+  margin:6px 0 0;
+  max-height:260px;
+  overflow-x:hidden;
+  overflow-y:auto;
+  overflow-wrap:anywhere;
+  word-break:break-word;
+  font-size:var(--font-ui-smaller);
+}
+.schema-studio-xxl-preview ul { margin:0; padding-left:1.4em; }
+.schema-studio-xxl-preview li { margin:1px 0; line-height:1.5; }
+/* 改动点行内标注：与数据库域单元格 diff 同款观感（旧值删除线 → 新值加粗） */
+.schema-studio-xxl-preview del { color:var(--text-error); opacity:.72; margin-right:2px; }
+.schema-studio-xxl-preview del + strong { color:var(--text-normal); }
+.schema-studio-xxl-changes-line {
+  margin:0 0 4px;
+  font-size:var(--font-ui-smaller);
+  color:var(--text-muted);
+}
 
 /* Schema Studio v0.5 - Bases-like editable grid */
 .schema-studio-grid-wrap {

@@ -22,10 +22,20 @@ function dirOf(path: string): string {
 }
 
 /** 把生成计划写入 vault；按冲突策略处理已存在文档 */
+export interface ApplyPlansOptions {
+	/**
+	 * 智能跳过：skip 策略下，已存在文档**有属性改动**就按更新写入
+	 * （mergePreservingBody 保留手写正文），只有**完全无改动**才真的跳过。
+	 * 依赖宿主在分析阶段给 plan 挂上 changes。
+	 */
+	smartSkip?: boolean;
+}
+
 export async function applyPlans(
 	app: App,
 	plans: FilePlan[],
 	policy: ConflictPolicy,
+	options: ApplyPlansOptions = {},
 ): Promise<ImportOutcome> {
 	const outcome = emptyOutcome();
 
@@ -53,11 +63,13 @@ export async function applyPlans(
 				outcome.failed.push({ path, reason: "同名路径已存在且不是文件" });
 				continue;
 			}
-			if (policy === "skip") {
+			// 智能跳过：有属性改动的文档按更新处理（保留手写正文），无改动才跳过
+			const hasChange = !!options.smartSkip && (p.changes?.length || 0) > 0;
+			if (policy === "skip" && !hasChange) {
 				outcome.skipped.push(path);
 				continue;
 			}
-			if (policy === "update") {
+			if (policy === "skip" || policy === "update") {
 				const old = await app.vault.cachedRead(existing);
 				await app.vault.modify(existing, mergePreservingBody(old, p.content));
 				outcome.updated.push(path);

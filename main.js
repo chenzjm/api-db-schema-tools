@@ -1,7 +1,8 @@
 'use strict';
 const path = require('path');
 const {
-  Plugin, Modal, Notice, Setting, PluginSettingTab, TFile, EditorSuggest, normalizePath, stringifyYaml, setIcon
+  Plugin, Modal, Notice, Setting, PluginSettingTab, TFile, EditorSuggest, normalizePath, stringifyYaml, setIcon,
+  MarkdownRenderer, Component
 } = require('obsidian');
 // xxl-job XML 导入子模块：由本仓库 src/xxljob/ 构建产出，产物 xxljob-bundle.cjs 不入库。
 // bundle 内部不再 require('obsidian')（Obsidian 对插件子模块的 require 解析不可靠，会一路
@@ -3079,6 +3080,32 @@ class SchemaStudioModal extends Modal {
     });
   }
   onOpen(){this.modalEl.addClass('schema-studio-modal');this.render();}
+  onClose(){this.unloadMarkdownComponents();}
+  // 阅读模式渲染：MarkdownRenderer 需要 Component 承载子任务生命周期，
+  // 模态关闭时统一 unload，避免每次重渲染都泄漏一批渲染任务。
+  ensureMarkdownComponent(){
+    if(this._mdComponent)return this._mdComponent;
+    this._mdComponent=new Component();
+    this._mdComponent.load();
+    if(!this._mdComponents)this._mdComponents=[];
+    this._mdComponents.push(this._mdComponent);
+    return this._mdComponent;
+  }
+  unloadMarkdownComponents(){
+    for(const c of this._mdComponents||[])try{c.unload();}catch(e){/* 已卸载 */}
+    this._mdComponents=[];this._mdComponent=null;
+  }
+  // 把 markdown 渲染进容器（阅读模式）。MarkdownRenderer 不可用时降级为纯文本，不影响主流程。
+  renderMarkdown(el,markdown,sourcePath){
+    if(!el)return;
+    const md=String(markdown??'');
+    if(typeof MarkdownRenderer?.render!=='function'){el.setText(md);return;}
+    try{
+      const comp=this.ensureMarkdownComponent();
+      const done=MarkdownRenderer.render(this.app,md,el,String(sourcePath||''),comp);
+      if(done&&typeof done.catch==='function')done.catch(e=>{console.warn('[Schema Studio] 阅读模式渲染失败',e);el.setText(md);});
+    }catch(e){console.warn('[Schema Studio] 阅读模式渲染失败',e);el.setText(md);}
+  }
   getPendingEditStats(){
     let records=0,cells=0;
     for(const edits of this.pendingEdits.values()){const n=Object.keys(edits||{}).length;if(n){records++;cells+=n;}}
@@ -3182,10 +3209,15 @@ class SchemaStudioModal extends Modal {
         const card=list.createDiv({cls:'schema-studio-xxl-card'});
         const chip=card.createDiv({text:f.name,cls:'schema-studio-file-chip schema-studio-xxl-card-title'});
         chip.onclick=()=>{const file=this.app.vault.getAbstractFileByPath(f.file.path);if(file instanceof TFile)void this.app.workspace.getLeaf(false).openFile(file);};
-        const pre=card.createEl('pre',{text:'（读取中…）',cls:'schema-studio-xxl-preview-body'});
+        // 浏览页的「笔记属性」预览也走阅读模式，与导入清单页保持一致
+        const host=card.createDiv({cls:'schema-studio-xxl-preview'});
+        host.setText('（读取中…）');
         void this.app.vault.cachedRead(f.file)
-          .then(text=>{pre.setText(xxl.frontmatterBlock(text)||'（无笔记属性）');})
-          .catch(()=>pre.setText('（读取失败）'));
+          .then(text=>{
+            host.empty();
+            this.renderMarkdown(host,xxl.frontmatterToMarkdown(text)||'（无笔记属性）',f.file.path);
+          })
+          .catch(()=>host.setText('（读取失败）'));
       }
     }
   }
@@ -3761,12 +3793,21 @@ class SchemaStudioModal extends Modal {
     if(!res){this.page='xxljob-import';return this.render();}
     const policy=state.policy||xxlSettings(this.plugin).conflictPolicy;
     const policyLabel={skip:'跳过',update:'更新',rename:'新建副本'}[policy]||policy;
-    let willCreate=0,willTouch=0,willChange=0;
+    // 智能跳过：skip 策略下有属性改动的文档按更新写入，只有完全无改动才真的跳过。
+    // 这样「目标状态」与用户预期一致——检测到改动就是更新，而不是一句「跳过（N 处改动）」。
+    const planAction=(p)=>{
+      if(!this.app.vault.getAbstractFileByPath(p.path))return 'create';
+      if(policy==='rename')return 'rename';
+      if(policy==='update')return 'update';
+      return (p.changes&&p.changes.length)?'update':'skip';
+    };
+    let willCreate=0,willUpdate=0,willRename=0,willSkip=0;
     for(const p of res.plans){
-      if(this.app.vault.getAbstractFileByPath(p.path)){willTouch++;if(p.changes&&p.changes.length)willChange++;}
-      else willCreate++;
+      const a=planAction(p);
+      if(a==='create')willCreate++;else if(a==='update')willUpdate++;else if(a==='rename')willRename++;else willSkip++;
     }
-    this.renderHeader('xxl-job 导入清单',`共 ${res.plans.length} 份：新建 ${willCreate} · 已存在 ${willTouch}${willChange?` · 其中 ${willChange} 份有属性改动`:''}（按「${policyLabel}」处理）`,[
+    const smartNote=policy==='skip'?'（策略「跳过」：有属性改动则更新、无改动才跳过）':`（按「${policyLabel}」处理）`;
+    this.renderHeader('xxl-job 导入清单',`共 ${res.plans.length} 份：新建 ${willCreate} · 更新 ${willUpdate}${willRename?` · 新建副本 ${willRename}`:''} · 跳过 ${willSkip} ${smartNote}`,[
       {text:'返回修改',onclick:()=>{this.page='xxljob-import';this.render();}},
       {text:'写入文档',primary:true,onclick:()=>{void this.applyXxljob(state);}}
     ]);
@@ -3774,40 +3815,28 @@ class SchemaStudioModal extends Modal {
     const wrap=this.mainEl.createDiv({cls:'schema-tools-table-wrap'});const table=wrap.createEl('table',{cls:'schema-tools-table'});
     const hr=table.createEl('thead').createEl('tr');['类型','文档','输出路径','目标状态'].forEach(x=>hr.createEl('th',{text:x}));
     const body=table.createEl('tbody');
-    const fmtVal=v=>{const s=String(v??'').replace(/\s+/g,' ').trim();return s.length>60?`${s.slice(0,60)}…`:s;};
     for(const p of res.plans){
-      const exists=!!this.app.vault.getAbstractFileByPath(p.path);
-      const nChanges=p.changes&&p.changes.length||0;
-      const status=exists?(policy==='skip'?'跳过':policy==='update'?'更新':'新建副本')+(nChanges?`（${nChanges} 处改动）`:''):'新建';
-      const tr=body.createEl('tr',{cls:`schema-status-${exists?(nChanges||policy==='update'?'changed':'unchanged'):'added'}`});
+      const action=planAction(p),nChanges=p.changes&&p.changes.length||0;
+      const status=action==='create'?'新建':action==='rename'?'新建副本':action==='update'?`更新${nChanges?`（${nChanges} 处改动）`:''}`:'跳过';
+      const tr=body.createEl('tr',{cls:`schema-status-${action==='create'?'added':action==='update'?'changed':action==='rename'?'changed':'unchanged'}`});
       tr.createEl('td',{text:p.kind});
       tr.createEl('td',{text:p.title});
       tr.createEl('td',{text:p.path,cls:'schema-studio-diff-property'});
       tr.createEl('td',{text:status});
       const preview=body.createEl('tr');const cell=preview.createEl('td',{attr:{colspan:'4'}});
       const det=cell.createEl('details');det.createEl('summary',{text:'预览'});
-      // 改动点：手工改过的文档重导入时，逐项列出「键：旧值 → 新值」，不再只给一句「跳过」
-      if(nChanges){
-        const box=det.createDiv({cls:'schema-studio-xxl-changes'});
-        box.createDiv({text:`改动点 ${nChanges} 处${exists&&policy==='skip'?'（当前策略为跳过，不会写入）':''}`,cls:'schema-tools-label'});
-        for(const c of p.changes){
-          const row=box.createDiv({cls:'schema-studio-xxl-change-row'});
-          const tag=row.createSpan({cls:`schema-studio-xxl-change-tag schema-status-${c.type}`});
-          tag.setText(c.type==='changed'?'修改':c.type==='added'?'新增':'删除');
-          row.createSpan({text:c.key,cls:'schema-studio-diff-property'});
-          if(c.type==='removed')row.createEl('del',{text:fmtVal(c.oldValue),cls:'schema-studio-xxl-change-del'});
-          else if(c.type==='added')row.createEl('ins',{text:fmtVal(c.newValue),cls:'schema-studio-xxl-change-ins'});
-          else{row.createEl('del',{text:fmtVal(c.oldValue),cls:'schema-studio-xxl-change-del'});row.createSpan({text:'→'});row.createEl('ins',{text:fmtVal(c.newValue),cls:'schema-studio-xxl-change-ins'});}
-        }
-      }
-      det.createEl('pre',{text:xxl.frontmatterBlock(p.content)||'（无笔记属性）',cls:'schema-studio-file-chip schema-studio-xxl-preview-body'});
+      // 只留一行汇总：改动细节直接标在下方属性行里（旧值删除线 → 新值），不再单列一坨列表
+      if(nChanges)det.createDiv({text:`属性改动 ${nChanges} 处`,cls:'schema-studio-xxl-changes-line'});
+      const host=det.createDiv({cls:'schema-studio-xxl-preview'});
+      this.renderMarkdown(host,xxl.frontmatterToMarkdown(p.content,p.changes)||'（无笔记属性）',p.path);
     }
   }
   async applyXxljob(state){
     const s=xxlSettings(this.plugin);
     const policy=state.policy||s.conflictPolicy;
     let outcome;
-    try{outcome=await xxl.applyXxljobPlans(this.app,state.analysis.plans,policy);}
+    // 智能跳过交给 bundle：skip 策略下有属性改动的文档走 update（保留手写正文），无改动才跳过
+    try{outcome=await xxl.applyXxljobPlans(this.app,state.analysis.plans,policy,{smartSkip:true});}
     catch(e){console.error('[Schema Studio] xxl-job 导入失败',e);new Notice(`xxl-job 导入失败：${e?.message||e}`);return;}
     let list=s.executors;
     for(const g of state.analysis.jobGroups||[]){

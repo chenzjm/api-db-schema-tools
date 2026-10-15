@@ -1,6 +1,6 @@
 {
   "name": "api-db-schema-tools",
-  "version": "0.9.6",
+  "version": "0.9.13",
   "private": true,
   "description": "Schema Studio：接口 / 数据库结构管理，并集成 xxl-job XML 导入（第三个域页签）。",
   "license": "MIT",

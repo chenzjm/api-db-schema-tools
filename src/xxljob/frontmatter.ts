@@ -58,6 +58,37 @@ export interface FrontmatterChange {
 }
 
 /**
+ * 笔记属性块 → markdown 列表（供阅读模式渲染，不再展示 YAML 源码）。
+ *
+ * 有改动点时行内标注（与数据库域的单元格 diff 同款观感）：
+ * 修改 → `~~旧值~~ → **新值**`；新增 → `**新值**`；删除 → `~~旧值~~`。
+ * 删除的键不在新文档里，追在末尾——提示这些手写属性会被覆盖清除。
+ */
+export function frontmatterToMarkdown(content: string, changes?: FrontmatterChange[]): string {
+	const parsed = splitFrontmatter(content);
+	const entries = frontmatterEntries(parsed ? parsed.fm : "");
+	const byKey = new Map<string, FrontmatterChange>();
+	for (const c of changes || []) byKey.set(c.key, c);
+	// 多行值（任务参数 JSON 列表等）缩进续行，保持同一个 markdown 列表项
+	const fmtValue = (v?: string) => {
+		const raw = String(v ?? "").replace(/\r?\n\s*/g, "\n  ").trim();
+		return raw || "（空）";
+	};
+	const lines: string[] = [];
+	for (const [k, v] of entries) {
+		const c = byKey.get(k);
+		if (c?.type === "changed") lines.push(`- **${k}**：~~${fmtValue(c.oldValue)}~~ → **${fmtValue(c.newValue)}**`);
+		else if (c?.type === "added") lines.push(`- **${k}**：**${fmtValue(c.newValue)}**`);
+		else lines.push(`- **${k}**：${fmtValue(v)}`);
+	}
+	for (const c of changes || []) {
+		if (c.type !== "removed" || entries.has(c.key)) continue;
+		lines.push(`- **${c.key}**：~~${fmtValue(c.oldValue)}~~`);
+	}
+	return lines.join("\n");
+}
+
+/**
  * 对比两份文档的 frontmatter，返回属性级改动点。
  * 排序：修改 → 新增 → 删除（各自保持文档内键序），调用方按需展示。
  */

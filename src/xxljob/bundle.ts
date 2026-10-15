@@ -15,11 +15,12 @@ import {
 	type FlowTree,
 } from "./mapping";
 import { buildImportPlans, mergePreservingBody, LINK_HEADINGS, type TemplateSources } from "./writer";
-import { applyPlans, type ImportOutcome } from "./importer";
+import { applyPlans, type ApplyPlansOptions, type ImportOutcome } from "./importer";
 import { readTemplate, readTemplates, type TemplatePaths } from "./templates";
 import {
 	frontmatterBlock,
 	frontmatterEntries,
+	frontmatterToMarkdown,
 	diffFrontmatter,
 	type FrontmatterChange,
 } from "./frontmatter";
@@ -96,8 +97,9 @@ export async function applyXxljobPlans(
 	app: App,
 	plans: FilePlan[],
 	policy: ConflictPolicy,
+	options: ApplyPlansOptions = {},
 ): Promise<ImportOutcome> {
-	return applyPlans(app, plans, policy);
+	return applyPlans(app, plans, policy, options);
 }
 
 // ---------- 可选：沿用独立插件的四步向导 ----------
@@ -137,8 +139,9 @@ export {
 	buildImportPlans,
 	mergePreservingBody,
 	frontmatterBlock,
-	diffFrontmatter,
 	frontmatterEntries,
+	frontmatterToMarkdown,
+	diffFrontmatter,
 	LINK_HEADINGS,
 	applyPlans,
 	readTemplate,
@@ -155,4 +158,4 @@ export {
 	executorListToText,
 	textToExecutorList,
 };
-export type { TemplateSources, TemplatePaths, ConflictPolicy, ExecutorEntry, FilePlan, ImportOutcome, FlowTree, ParsedJob, FrontmatterChange };
+export type { TemplateSources, TemplatePaths, ConflictPolicy, ExecutorEntry, FilePlan, ImportOutcome, ApplyPlansOptions, FlowTree, ParsedJob, FrontmatterChange };

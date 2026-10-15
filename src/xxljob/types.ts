@@ -1,4 +1,6 @@
 // xxl-job 导出 XML 的统一数据模型（解析层输出）
+import type { FrontmatterChange } from "./frontmatter";
+
 export type XxlLevel = "MAIN" | "VIRTUAL" | "COMPONENT";
 
 export interface FlowNode {
@@ -75,4 +77,9 @@ export interface FilePlan {
 	title: string; // 文档名（文件名去 .md）
 	jobId: string;
 	source: SourceInfo;
+	/**
+	 * 宿主分析阶段挂上的属性级改动点（对比已存在文档得出）。
+	 * 不给值 = 未比对；applyPlans 的 smartSkip 靠它判断「有改动就更新」。
+	 */
+	changes?: FrontmatterChange[];
 }

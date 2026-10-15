@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { parseXxlXml } from "../../src/xxljob/parser";
 import { buildFlowTree, mapEnum, ROUTE_MAP, resolveJobBeanName, sanitizeFileName } from "../../src/xxljob/mapping";
 import { buildImportPlans, mergePreservingBody, type TemplateSources } from "../../src/xxljob/writer";
-import { splitFrontmatter, frontmatterBlock, frontmatterEntries, diffFrontmatter } from "../../src/xxljob/frontmatter";
+import { splitFrontmatter, frontmatterBlock, frontmatterEntries, frontmatterToMarkdown, diffFrontmatter } from "../../src/xxljob/frontmatter";
 
 // 测试脚本统一从仓库根目录执行（npm test）
 const TPL_DIR = join(process.cwd(), "templates", "xxljob");
@@ -374,6 +374,37 @@ test("diffFrontmatter：属性级改动点（手工改后重导入可检出）",
 	assert.doesNotMatch(String(nameHit.newValue), /手工改过/);
 	assert.ok(changes.some((c) => c.key === "手写键" && c.type === "removed"), "手工新增的键应报删除");
 	assert.equal(changes.find((c) => c.key === "执行器"), undefined, "未变的键不应出现");
+});
+
+test("frontmatterToMarkdown：阅读模式列表 + 改动点行内标注", () => {
+	const tree = buildFlowTree([parseXxlXml(synthetic)]);
+	const { plans } = buildImportPlans(tree, () => "测试执行器", { templates: TEMPLATES });
+	const taskA = plans.find((p) => p.title === "任务A")!;
+	// 无改动：纯 `键：值` 列表，不含 YAML 源码痕迹
+	const plain = frontmatterToMarkdown(taskA.content);
+	assert.doesNotMatch(plain, /^---$/m, "不应再输出 --- 分隔线");
+	assert.match(plain, /^- \*\*任务名称\*\*：/m, "应为 markdown 列表且键加粗");
+	assert.doesNotMatch(plain, /~~/, "无改动时不应有删除线");
+
+	const manual = taskA.content
+		.replace(/^任务名称:.*$/m, "任务名称: 【蚂蚁星河-广州盛大】手工改过")
+		.replace(/^fileClass: 批任务$/m, "fileClass: 批任务\n手写键: 保留我");
+	const changes = diffFrontmatter(manual, taskA.content);
+	const md = frontmatterToMarkdown(taskA.content, changes);
+	// 修改：旧值删除线 → 新值加粗
+	assert.match(md, /^- \*\*任务名称\*\*：~~.*手工改过.*~~ → \*\*/m, "修改键应标出 旧值删除线 → 新值");
+	// 删除的手写键追在末尾，提示会被覆盖清除
+	assert.ok(md.indexOf("手写键") > md.indexOf("任务名称"), "删除键应排在末尾");
+	assert.match(md, /\*\*手写键\*\*：~~保留我~~/, "删除键应只有旧值删除线");
+	// 未改动的键保持原样
+	assert.doesNotMatch(md.split("手写键")[0], /\*\*执行器\*\*：~~/, "未改动键不应被标成改动");
+	assert.equal(frontmatterToMarkdown("没有 frontmatter"), "");
+});
+
+test("frontmatterToMarkdown：空值与多行值", () => {
+	const md = frontmatterToMarkdown("---\na: \nb:\n  - x\n  - y\n---\n正文");
+	assert.match(md, /\*\*a\*\*：（空）/, "空值用「（空）」占位");
+	assert.match(md, /\*\*b\*\*：\n?\s*- x/, "多行值缩进续行");
 });
 
 test("无模板时回退内置结构", () => {
