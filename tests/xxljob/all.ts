@@ -309,6 +309,34 @@ test("update 合并：清掉废弃键、补归属章节、保留手写正文", (
 	assert.doesNotMatch(refreshed, /旧执行器/);
 	assert.match(bodyOf(refreshed), /\[\[8\.xxljob\/测试执行器\/任务流\/主链路\|主链路\]\]/);
 	assert.match(refreshed, /# 任务说明/);
+
+	// vault 里旧版导入的真实结构：归属章节是文末最后一个一级章节，且章节后还有手写内容。
+	// 回归：刷新归属章节时不能把章节后的手写内容吞掉（曾因整节替换到文末而丢失）。
+	const realShape = [
+		"---",
+		"fileClass: 批任务",
+		"任务名称: 任务A",
+		"---",
+		"",
+		"# 任务说明",
+		"",
+		"```mermaid",
+		"graph TD",
+		"```",
+		"",
+		"# 对应任务流",
+		"",
+		"[[8.xxljob/旧执行器/任务流/旧名称|旧名称]]",
+		"",
+		"<!-- 人工补充：这段要留住 -->",
+		"",
+	].join("\n");
+	const realMerged = mergePreservingBody(realShape, taskA.content);
+	assert.match(bodyOf(realMerged), /\[\[8\.xxljob\/测试执行器\/任务流\/主链路\|主链路\]\]/, "归属双链应刷新");
+	assert.doesNotMatch(realMerged, /旧执行器/, "旧双链应被替换");
+	assert.match(realMerged, /<!-- 人工补充：这段要留住 -->/, "归属章节后的手写内容必须保留");
+	assert.match(realMerged, /# 任务说明/, "任务说明章节必须保留");
+	assert.match(realMerged, /```mermaid/, "mermaid 块必须保留");
 });
 
 test("无模板时回退内置结构", () => {

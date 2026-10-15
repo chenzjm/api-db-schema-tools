@@ -153,8 +153,21 @@ export interface LinkSection {
 }
 
 /**
+ * 归属章节里的受管行：父级双链 / 待确认提示（均由生成器写入，刷新时替换）。
+ * 其余行视为用户手写内容，刷新章节时保留——否则「归属章节恰好是文末最后一个
+ * 一级章节」时（vault 里旧版导入的文档正是如此），章节后的手写内容会被整节替换吞掉。
+ */
+function isManagedLinkLine(line: string): boolean {
+	const t = line.trim();
+	if (!t) return false;
+	if (/^\[\[.*\]\]$/.test(t)) return true; // [[路径|别名]] 双链
+	if (/^待确认（/.test(t)) return true; // 待确认（未归属到批任务）/ 待确认（链路入口，暂无所属任务流）
+	return false;
+}
+
+/**
  * 在正文里保证存在指定一级章节：
- * - 已有该标题 → 整节替换（原地，到下一个一级标题或文末）
+ * - 已有该标题 → 原地刷新（受管行替换为新内容，章节内其余手写行保留）
  * - 没有 → 插在「# 任务说明」之前（归属关系排在任务说明前面）
  * - 没有「# 任务说明」→ 插在第一个 mermaid 之后；再没有则追加到文末
  */
@@ -165,8 +178,15 @@ function upsertSection(body: string, heading: string, content: string): string {
 		const after = start + m[0].length;
 		const next = /^#[ \t]+\S/m.exec(body.slice(after));
 		const end = next ? after + next.index : body.length;
+		// 旧章节里除受管行外的行（用户手写）保留到新章节之后
+		const kept = body
+			.slice(after, end)
+			.split("\n")
+			.filter((l) => !isManagedLinkLine(l))
+			.join("\n")
+			.trim();
 		const tail = body.slice(end).replace(/^\n+/, "");
-		return `${body.slice(0, start)}# ${heading}\n\n${content}\n\n${tail}`;
+		return `${body.slice(0, start)}# ${heading}\n\n${content}\n\n${kept ? `${kept}\n\n` : ""}${tail}`;
 	}
 	const section = `# ${heading}\n\n${content}\n\n`;
 	const taskNote = /^#[ \t]+任务说明[ \t]*$/m.exec(body);
@@ -313,7 +333,8 @@ function readSection(body: string, heading: string): string | undefined {
 /**
  * update 策略下的合并：保留旧文档手写正文，但
  * 1) frontmatter 整体替换为新生成的（顺带清掉已废弃的 对应任务流名称 / 对应批任务名称）
- * 2) 归属章节（# 对应任务流 / # 对应批任务）以新内容为准插入或刷新
+ * 2) 归属章节（# 对应任务流 / # 对应批任务）以新内容为准插入或刷新；
+ *    章节内的受管行（双链 / 待确认）被替换，用户在手写行保留
  */
 export function mergePreservingBody(oldContent: string, newContent: string): string {
 	const o = splitFrontmatter(oldContent);
