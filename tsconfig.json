@@ -1,0 +1,22 @@
+{
+	"compilerOptions": {
+		"baseUrl": ".",
+		"module": "ESNext",
+		"target": "ES6",
+		"allowJs": false,
+		"noImplicitAny": true,
+		"moduleResolution": "node",
+		"importHelpers": true,
+		"isolatedModules": true,
+		"strictNullChecks": true,
+		"strict": true,
+		"lib": ["DOM", "ES6", "ES2021"],
+		"paths": {
+			"*": ["./node_modules/*"]
+		}
+	},
+	// 只覆盖 xxl-job 子模块的 TypeScript 源码；
+	// 根目录的 main.js 是手工 CJS，不在编译范围内（也绝不能被构建产物覆盖）。
+	// tests/ 不进类型检查（与 xxljob 原仓库一致，靠 esbuild 转译后由 node:test 跑）。
+	"include": ["src/xxljob/**/*.ts"]
+}

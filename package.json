@@ -1,0 +1,25 @@
+{
+  "name": "api-db-schema-tools",
+  "version": "0.9.1",
+  "private": true,
+  "description": "Schema Studio：接口 / 数据库结构管理，并集成 xxl-job XML 导入（第三个域页签）。",
+  "license": "MIT",
+  "author": "chenzhongjun",
+  "scripts": {
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.xxljob.mjs",
+    "build:xxljob": "node esbuild.xxljob.mjs",
+    "watch:xxljob": "node esbuild.xxljob.mjs --watch",
+    "typecheck": "tsc -noEmit -skipLibCheck",
+    "test": "node scripts/test.mjs && node scripts/bundle-check.mjs",
+    "bundle:check": "node scripts/bundle-check.mjs",
+    "dryrun": "node scripts/dryrun.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "builtin-modules": "^5.0.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "latest",
+    "tslib": "^2.8.0",
+    "typescript": "^5.8.3"
+  }
+}

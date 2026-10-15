@@ -1,4 +1,4 @@
-# 接口与数据库结构工具 v0.9.0
+# 接口与数据库结构工具 v0.9.1
 
 Schema Studio 用于维护接口字段和数据库字段。底层仍然是普通 Markdown、YAML Frontmatter 和 Wikilink；Fileclass 提供属性定义，Schema Tools 负责 JSON/DDL 导入、字段管理和精准引用。本仓库的接口字段属性名称统一使用中文，接口协议里的字段名、路径和类型保留原始写法。
 
@@ -41,19 +41,41 @@ Schema Studio 用于维护接口字段和数据库字段。底层仍然是普通
 来源信息（原任务 id、来源 XML、导入时间）写入 `<文档根目录>/.xxljob-state.json`，
 与数据库域的 `_data/.schema-state.json` 分开，互不污染，也不写进业务文档正文。
 
-### 4. 子模块依赖
+### 4. 源码位置与构建
 
-xxl-job 的实现来自独立仓库 [`xxljob-flow-atlas`](https://github.com/chenzjm/xxljob-flow-atlas)
-（TypeScript + esbuild + 测试）。它以 `xxljob-bundle.cjs` 的形式被本插件 `require`：
+xxl-job 的实现**已搬进本仓库**，就在 `src/xxljob/`（TypeScript），不再从外部仓库拷 bundle：
+
+| 路径 | 内容 |
+|---|---|
+| `src/xxljob/*.ts` | 解析 / 建树 / 模板渲染 / 写盘 / 执行器清单等（不含独立插件入口 `main.ts`） |
+| `src/xxljob/ui/importModal.ts` | 四步导入向导（可选，Studio 自己也有内联导入页） |
+| `tests/xxljob/` | 单元测试（16 条）+ 模板基线 `templates/xxljob/` |
+| `scripts/` | `test.mjs` / `bundle-check.mjs` / `dryrun.*` |
+| `xxljob-bundle.cjs` | **构建产物，不入库**；由 esbuild 从 `src/xxljob/bundle.ts` 产出 |
+
+```bash
+npm install          # 首次：装 esbuild / typescript / obsidian 类型
+npm run build        # 类型检查 + 产出 xxljob-bundle.cjs
+npm test             # 16 条单元测试 + bundle 冒烟
+npm run dryrun -- <xml...> --write --templates=<模板目录>
+```
+
+`./sync.sh to-vault|deploy` 会**先构建再部署**，所以日常改完 `src/xxljob/` 直接跑 sync.sh 即可。
+
+> ⚠️ 构建脚本只输出 `xxljob-bundle.cjs`，**绝不会覆盖根目录手工维护的 `main.js`**
+> （本插件主体仍是手工 CJS，`tsconfig.json` 的 include 只涵盖 `src/xxljob/`）。
+
+产物由 `require('./xxljob-bundle.cjs')` 加载，包在 try/catch 里：
 
 ```js
 let xxl = null;
 try { xxl = require('./xxljob-bundle.cjs'); } catch (e) { /* 降级：xxl-job 域不可用 */ }
 ```
 
-**没拷进来时整个 xxl-job 域自动隐藏为不可用，接口 / 数据库两条链路不受影响。**
-在 `xxljob-flow-atlas` 仓库执行 `./sync.sh to-vault` 会把 bundle 同步到本仓库与 vault 插件目录；
-本仓库的 `sync.sh` 也已把 `xxljob-bundle.cjs` 列入部署文件。
+**没构建 / 产物缺失时整个 xxl-job 域降级为不可用，接口 / 数据库两条链路不受影响。**
+
+> 独立仓库 [`xxljob-flow-atlas`](https://github.com/chenzjm/xxljob-flow-atlas) 仍保留（独立插件形态与
+> 上架分发），但**主力库已停用**，不再向本仓库同步 bundle；本仓库的 `src/xxljob/` 是唯一开发主线。
 
 ## v0.8.2：新建表文档按模板生成（含 schema 子目录与表注释）
 

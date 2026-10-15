@@ -7,3 +7,9 @@ data.json
 # 手工备份
 *.bak-*
 *.bak
+
+# xxl-job 子模块：TypeScript 源码在 src/xxljob/，产物由 npm run build 生成，不入库
+node_modules/
+xxljob-bundle.cjs
+.testtmp/
+.dryrun/

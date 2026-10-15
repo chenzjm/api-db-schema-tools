@@ -18,7 +18,20 @@ if [ ! -d "$VAULT" ]; then
   exit 1
 fi
 
+# xxl-job 子模块：TypeScript 源码在 src/xxljob/，产物 xxljob-bundle.cjs 由 esbuild 生成（不入库）。
+# 没装依赖时静默跳过——此时沿用上一份已生成的产物，不至于把部署卡住。
+build_xxljob() {
+  [ -f "$REPO/package.json" ] && [ -f "$REPO/src/xxljob/bundle.ts" ] || return 0
+  if [ ! -d "$REPO/node_modules" ]; then
+    echo "跳过 xxl-job 构建：未安装依赖（首次请先在仓库里 npm install）" >&2
+    return 0
+  fi
+  echo "构建 xxljob-bundle.cjs…"
+  (cd "$REPO" && npm run build:xxljob >/dev/null)
+}
+
 deploy_to_vault() {
+  build_xxljob
   for f in "${FILES[@]}"; do
     [ -f "$REPO/$f" ] || { echo "仓库缺少文件：$f" >&2; exit 1; }
     cp "$REPO/$f" "$VAULT/$f"
