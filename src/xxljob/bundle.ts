@@ -17,6 +17,12 @@ import {
 import { buildImportPlans, mergePreservingBody, LINK_HEADINGS, type TemplateSources } from "./writer";
 import { applyPlans, type ImportOutcome } from "./importer";
 import { readTemplate, readTemplates, type TemplatePaths } from "./templates";
+import {
+	frontmatterBlock,
+	frontmatterEntries,
+	diffFrontmatter,
+	type FrontmatterChange,
+} from "./frontmatter";
 import { XxlImportModal } from "./ui/importModal";
 import { DEFAULT_SETTINGS, type ConflictPolicy } from "./settings";
 import {
@@ -130,6 +136,9 @@ export {
 	buildFlowTree,
 	buildImportPlans,
 	mergePreservingBody,
+	frontmatterBlock,
+	diffFrontmatter,
+	frontmatterEntries,
 	LINK_HEADINGS,
 	applyPlans,
 	readTemplate,
@@ -146,4 +155,4 @@ export {
 	executorListToText,
 	textToExecutorList,
 };
-export type { TemplateSources, TemplatePaths, ConflictPolicy, ExecutorEntry, FilePlan, ImportOutcome, FlowTree, ParsedJob };
+export type { TemplateSources, TemplatePaths, ConflictPolicy, ExecutorEntry, FilePlan, ImportOutcome, FlowTree, ParsedJob, FrontmatterChange };

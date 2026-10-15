@@ -1975,6 +1975,7 @@ class SchemaStudioModal extends Modal {
     return [...map.values()].sort((a,b)=>a.label.localeCompare(b.label,'zh-CN')).map(x=>({...x,detail:`${x.counts.flow} 个任务流 / ${x.counts.task} 个任务 / ${x.counts.component} 个组件`}));
   }
   renderXxljobBrowse(){
+    if(!xxl){this.xxljobUnavailable();return;}
     const groups=this.getXxljobGroups(),folder=this.plugin.settings.xxljobDocsFolder||DEFAULTS.xxljobDocsFolder;
     if(!groups.length){this.renderWelcome('还没有 xxl-job 文档',`点左下角「+ 导入 xxl-job XML」，从 xxl-job 平台导出的 XML 生成 ${folder}/<执行器>/{任务流,任务,任务组件} 三级文档。`);return;}
     const group=groups.find(g=>g.key===this.selectedKey)||groups[0];this.selectedKey=group.key;
@@ -1985,10 +1986,16 @@ class SchemaStudioModal extends Modal {
       const files=group.files.filter(f=>f.level===dirName).sort((a,b)=>a.name.localeCompare(b.name,'zh-CN'));
       if(!files.length)continue;
       this.mainEl.createDiv({text:`${dirName}（${files.length}）`,cls:'schema-tools-label'});
-      const list=this.mainEl.createDiv({cls:'schema-studio-selected-files'});
+      const list=this.mainEl.createDiv({cls:'schema-studio-selected-files schema-studio-xxl-list'});
       for(const f of files){
-        const chip=list.createDiv({text:f.name,cls:'schema-studio-file-chip'});
+        // 每份文档一张卡片：标题点击打开笔记，下方只预览「笔记属性」块
+        const card=list.createDiv({cls:'schema-studio-xxl-card'});
+        const chip=card.createDiv({text:f.name,cls:'schema-studio-file-chip schema-studio-xxl-card-title'});
         chip.onclick=()=>{const file=this.app.vault.getAbstractFileByPath(f.file.path);if(file instanceof TFile)void this.app.workspace.getLeaf(false).openFile(file);};
+        const pre=card.createEl('pre',{text:'（读取中…）',cls:'schema-studio-xxl-preview-body'});
+        void this.app.vault.cachedRead(f.file)
+          .then(text=>{pre.setText(xxl.frontmatterBlock(text)||'（无笔记属性）');})
+          .catch(()=>pre.setText('（读取失败）'));
       }
     }
   }
@@ -2455,6 +2462,16 @@ class SchemaStudioModal extends Modal {
       docsFolder:s.docsFolder,templates:state.templates,
       executorOfFile:(name)=>state.executorByName?.[name]||'',
     });
+    // 读已存在文档，计算属性级改动点：用户手工改过 → 重导入也能看到差异，而不是一句「跳过」
+    for(const p of state.analysis.plans){
+      p.existing=false;p.changes=[];
+      const file=this.app.vault.getAbstractFileByPath(p.path);
+      if(file){
+        p.existing=true;
+        try{p.changes=xxl.diffFrontmatter(await this.app.vault.cachedRead(file),p.content);}
+        catch(e){console.warn('[Schema Studio] 读取已存在文档失败',p.path,e);}
+      }
+    }
     this.page='xxljob-diff';this.render();
   }
   renderXxljobImport(){
@@ -2487,9 +2504,12 @@ class SchemaStudioModal extends Modal {
     if(!res){this.page='xxljob-import';return this.render();}
     const policy=state.policy||xxlSettings(this.plugin).conflictPolicy;
     const policyLabel={skip:'跳过',update:'更新',rename:'新建副本'}[policy]||policy;
-    let willCreate=0,willTouch=0;
-    for(const p of res.plans){if(this.app.vault.getAbstractFileByPath(p.path))willTouch++;else willCreate++;}
-    this.renderHeader('xxl-job 导入清单',`共 ${res.plans.length} 份：新建 ${willCreate} · 已存在 ${willTouch}（按「${policyLabel}」处理）`,[
+    let willCreate=0,willTouch=0,willChange=0;
+    for(const p of res.plans){
+      if(this.app.vault.getAbstractFileByPath(p.path)){willTouch++;if(p.changes&&p.changes.length)willChange++;}
+      else willCreate++;
+    }
+    this.renderHeader('xxl-job 导入清单',`共 ${res.plans.length} 份：新建 ${willCreate} · 已存在 ${willTouch}${willChange?` · 其中 ${willChange} 份有属性改动`:''}（按「${policyLabel}」处理）`,[
       {text:'返回修改',onclick:()=>{this.page='xxljob-import';this.render();}},
       {text:'写入文档',primary:true,onclick:()=>{void this.applyXxljob(state);}}
     ]);
@@ -2497,17 +2517,33 @@ class SchemaStudioModal extends Modal {
     const wrap=this.mainEl.createDiv({cls:'schema-tools-table-wrap'});const table=wrap.createEl('table',{cls:'schema-tools-table'});
     const hr=table.createEl('thead').createEl('tr');['类型','文档','输出路径','目标状态'].forEach(x=>hr.createEl('th',{text:x}));
     const body=table.createEl('tbody');
+    const fmtVal=v=>{const s=String(v??'').replace(/\s+/g,' ').trim();return s.length>60?`${s.slice(0,60)}…`:s;};
     for(const p of res.plans){
       const exists=!!this.app.vault.getAbstractFileByPath(p.path);
-      const status=exists?(policy==='skip'?'跳过':policy==='update'?'更新':'新建副本'):'新建';
-      const tr=body.createEl('tr',{cls:`schema-status-${exists?(policy==='skip'?'unchanged':'changed'):'added'}`});
+      const nChanges=p.changes&&p.changes.length||0;
+      const status=exists?(policy==='skip'?'跳过':policy==='update'?'更新':'新建副本')+(nChanges?`（${nChanges} 处改动）`:''):'新建';
+      const tr=body.createEl('tr',{cls:`schema-status-${exists?(nChanges||policy==='update'?'changed':'unchanged'):'added'}`});
       tr.createEl('td',{text:p.kind});
       tr.createEl('td',{text:p.title});
       tr.createEl('td',{text:p.path,cls:'schema-studio-diff-property'});
       tr.createEl('td',{text:status});
       const preview=body.createEl('tr');const cell=preview.createEl('td',{attr:{colspan:'4'}});
       const det=cell.createEl('details');det.createEl('summary',{text:'预览'});
-      det.createEl('pre',{text:String(p.content||'').split('\n').slice(0,16).join('\n'),cls:'schema-studio-file-chip'});
+      // 改动点：手工改过的文档重导入时，逐项列出「键：旧值 → 新值」，不再只给一句「跳过」
+      if(nChanges){
+        const box=det.createDiv({cls:'schema-studio-xxl-changes'});
+        box.createDiv({text:`改动点 ${nChanges} 处${exists&&policy==='skip'?'（当前策略为跳过，不会写入）':''}`,cls:'schema-tools-label'});
+        for(const c of p.changes){
+          const row=box.createDiv({cls:'schema-studio-xxl-change-row'});
+          const tag=row.createSpan({cls:`schema-studio-xxl-change-tag schema-status-${c.type}`});
+          tag.setText(c.type==='changed'?'修改':c.type==='added'?'新增':'删除');
+          row.createSpan({text:c.key,cls:'schema-studio-diff-property'});
+          if(c.type==='removed')row.createEl('del',{text:fmtVal(c.oldValue),cls:'schema-studio-xxl-change-del'});
+          else if(c.type==='added')row.createEl('ins',{text:fmtVal(c.newValue),cls:'schema-studio-xxl-change-ins'});
+          else{row.createEl('del',{text:fmtVal(c.oldValue),cls:'schema-studio-xxl-change-del'});row.createSpan({text:'→'});row.createEl('ins',{text:fmtVal(c.newValue),cls:'schema-studio-xxl-change-ins'});}
+        }
+      }
+      det.createEl('pre',{text:xxl.frontmatterBlock(p.content)||'（无笔记属性）',cls:'schema-studio-file-chip schema-studio-xxl-preview-body'});
     }
   }
   async applyXxljob(state){

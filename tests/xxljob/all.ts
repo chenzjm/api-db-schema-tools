@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { parseXxlXml } from "../../src/xxljob/parser";
 import { buildFlowTree, mapEnum, ROUTE_MAP, resolveJobBeanName, sanitizeFileName } from "../../src/xxljob/mapping";
 import { buildImportPlans, mergePreservingBody, type TemplateSources } from "../../src/xxljob/writer";
-import { splitFrontmatter } from "../../src/xxljob/frontmatter";
+import { splitFrontmatter, frontmatterBlock, frontmatterEntries, diffFrontmatter } from "../../src/xxljob/frontmatter";
 
 // 测试脚本统一从仓库根目录执行（npm test）
 const TPL_DIR = join(process.cwd(), "templates", "xxljob");
@@ -336,7 +336,44 @@ test("update 合并：清掉废弃键、补归属章节、保留手写正文", (
 	assert.doesNotMatch(realMerged, /旧执行器/, "旧双链应被替换");
 	assert.match(realMerged, /<!-- 人工补充：这段要留住 -->/, "归属章节后的手写内容必须保留");
 	assert.match(realMerged, /# 任务说明/, "任务说明章节必须保留");
-	assert.match(realMerged, /```mermaid/, "mermaid 块必须保留");
+  assert.match(realMerged, /```mermaid/, "mermaid 块必须保留");
+});
+
+test("frontmatterBlock 只取笔记属性块", () => {
+	const tree = buildFlowTree([parseXxlXml(synthetic)]);
+	const { plans } = buildImportPlans(tree, () => "测试执行器", { templates: TEMPLATES });
+	const block = frontmatterBlock(plans[0].content);
+	assert.ok(block.startsWith("---"), "应以 --- 开头");
+	assert.ok(block.trimEnd().endsWith("---"), "应以 --- 结尾");
+	assert.match(block, /fileClass:/);
+	assert.doesNotMatch(block, /# 对应/, "不应含正文章节");
+	assert.ok(block.length < plans[0].content.length, "应短于全文");
+	assert.equal(frontmatterBlock("没有 frontmatter 的正文"), "");
+});
+
+test("frontmatterEntries 续行并入上一键", () => {
+	const m = frontmatterEntries("a: 1\nb:\n  - x\n  - y\nc: 3");
+	assert.equal(m.get("a"), "1");
+	assert.equal(m.get("b"), "  - x\n  - y");
+	assert.equal(m.get("c"), "3");
+});
+
+test("diffFrontmatter：属性级改动点（手工改后重导入可检出）", () => {
+	const tree = buildFlowTree([parseXxlXml(synthetic)]);
+	const { plans } = buildImportPlans(tree, () => "测试执行器", { templates: TEMPLATES });
+	const taskA = plans.find((p) => p.title === "任务A")!;
+	assert.deepEqual(diffFrontmatter(taskA.content, taskA.content), [], "相同内容不应有改动点");
+	const manual = taskA.content
+		.replace(/^任务名称:.*$/m, "任务名称: 【蚂蚁星河-广州盛大】手工改过")
+		.replace(/^fileClass: 批任务$/m, "fileClass: 批任务\n手写键: 保留我");
+	const changes = diffFrontmatter(manual, taskA.content);
+	const nameHit = changes.find((c) => c.key === "任务名称");
+	assert.ok(nameHit, `应检出 任务名称 改动：${JSON.stringify(changes)}`);
+	assert.equal(nameHit.type, "changed");
+	assert.match(nameHit.oldValue!, /手工改过/);
+	assert.doesNotMatch(String(nameHit.newValue), /手工改过/);
+	assert.ok(changes.some((c) => c.key === "手写键" && c.type === "removed"), "手工新增的键应报删除");
+	assert.equal(changes.find((c) => c.key === "执行器"), undefined, "未变的键不应出现");
 });
 
 test("无模板时回退内置结构", () => {

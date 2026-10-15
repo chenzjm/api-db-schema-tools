@@ -21,3 +21,59 @@ export function mergeFrontmatter(oldContent: string, newContent: string): string
 	const body = o.body.startsWith("\n") ? o.body : `\n${o.body}`;
 	return `---\n${n.fm}\n---\n${body}`;
 }
+
+/** 只取 frontmatter 块（含首尾 --- 分隔线）；没有则返回空串。用于预览「笔记属性」 */
+export function frontmatterBlock(content: string): string {
+	const m = String(content ?? "").match(/^---\r?\n[\s\S]*?\r?\n---/);
+	return m ? m[0] : "";
+}
+
+/**
+ * frontmatter 行级键值解析：续行（缩进行 / 列表项）并入上一键，
+ * 让多行值（如任务参数 JSON 列表）也能整体对比。
+ */
+export function frontmatterEntries(fm: string): Map<string, string> {
+	const map = new Map<string, string>();
+	let key: string | null = null;
+	for (const raw of String(fm ?? "").split(/\r?\n/)) {
+		const line = raw.trimEnd();
+		if (!line.trim()) continue;
+		const m = line.match(/^([^:\s][^:]*?):\s*(.*)$/);
+		if (m && !/^\s+/.test(raw)) {
+			key = m[1].trim();
+			map.set(key, m[2] ?? "");
+		} else if (key) {
+			const prev = map.get(key) || "";
+			map.set(key, prev ? `${prev}\n${line}` : line);
+		}
+	}
+	return map;
+}
+
+export interface FrontmatterChange {
+	key: string;
+	type: "added" | "changed" | "removed";
+	oldValue?: string;
+	newValue?: string;
+}
+
+/**
+ * 对比两份文档的 frontmatter，返回属性级改动点。
+ * 排序：修改 → 新增 → 删除（各自保持文档内键序），调用方按需展示。
+ */
+export function diffFrontmatter(oldContent: string, newContent: string): FrontmatterChange[] {
+	const o = splitFrontmatter(oldContent);
+	const n = splitFrontmatter(newContent);
+	const oe = frontmatterEntries(o ? o.fm : "");
+	const ne = frontmatterEntries(n ? n.fm : "");
+	const changed: FrontmatterChange[] = [];
+	const added: FrontmatterChange[] = [];
+	const removed: FrontmatterChange[] = [];
+	for (const [k, v] of ne) if (!oe.has(k)) added.push({ key: k, type: "added", newValue: v });
+	for (const [k, v] of oe) {
+		const nv = ne.get(k);
+		if (nv === undefined) removed.push({ key: k, type: "removed", oldValue: v });
+		else if (nv !== v) changed.push({ key: k, type: "changed", oldValue: v, newValue: nv });
+	}
+	return [...changed, ...added, ...removed];
+}
