@@ -132,11 +132,17 @@
 /* 改动点行内标注：与数据库域单元格 diff 同款观感（旧值删除线 → 新值加粗） */
 .schema-studio-xxl-preview del { color:var(--text-error); opacity:.72; margin-right:2px; }
 .schema-studio-xxl-preview del + strong { color:var(--text-normal); }
-.schema-studio-xxl-changes-line {
-  margin:0 0 4px;
-  font-size:var(--font-ui-smaller);
-  color:var(--text-muted);
+/* 含删除线的属性行自动高亮——一眼锁定哪几行有改动 */
+.schema-studio-xxl-preview li:has(del) {
+  background:color-mix(in srgb, var(--text-warning) 8%, transparent);
+  border-radius:4px;
+  padding:1px 4px;
+  margin-left:-4px;
 }
+/* 导入清单 summary：有改动时直接列出改动键名 */
+.schema-studio-xxl-preview summary, details > summary { cursor:pointer; }
+details > summary { color:var(--text-muted); }
+details[open] > summary { color:var(--text-normal); }
 
 /* Schema Studio v0.5 - Bases-like editable grid */
 .schema-studio-grid-wrap {

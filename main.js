@@ -3824,9 +3824,11 @@ class SchemaStudioModal extends Modal {
       tr.createEl('td',{text:p.path,cls:'schema-studio-diff-property'});
       tr.createEl('td',{text:status});
       const preview=body.createEl('tr');const cell=preview.createEl('td',{attr:{colspan:'4'}});
-      const det=cell.createEl('details');det.createEl('summary',{text:'预览'});
-      // 只留一行汇总：改动细节直接标在下方属性行里（旧值删除线 → 新值），不再单列一坨列表
-      if(nChanges)det.createDiv({text:`属性改动 ${nChanges} 处`,cls:'schema-studio-xxl-changes-line'});
+      // 有改动的文档预览默认展开——与数据库域「打开就能看到 diff」的体验一致，
+      // 改动键名直接写在 summary 里，不用再展开翻找。
+      const changeKeys=(p.changes||[]).map(c=>c.key).join('、');
+      const det=cell.createEl('details',nChanges?{attr:{open:''}}:{});
+      det.createEl('summary',{text:nChanges?`预览 · 属性改动 ${nChanges} 处：${changeKeys}`:'预览'});
       const host=det.createDiv({cls:'schema-studio-xxl-preview'});
       this.renderMarkdown(host,xxl.frontmatterToMarkdown(p.content,p.changes)||'（无笔记属性）',p.path);
     }

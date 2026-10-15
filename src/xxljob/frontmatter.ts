@@ -69,10 +69,12 @@ export function frontmatterToMarkdown(content: string, changes?: FrontmatterChan
 	const entries = frontmatterEntries(parsed ? parsed.fm : "");
 	const byKey = new Map<string, FrontmatterChange>();
 	for (const c of changes || []) byKey.set(c.key, c);
-	// 多行值（任务参数 JSON 列表等）缩进续行，保持同一个 markdown 列表项
+	// 多行值（任务参数 JSON 列表等）缩进续行，保持同一个 markdown 列表项；
+	// 超长值截断——预览是给人看改动点的，整串 JSON 会把删除线淹没
 	const fmtValue = (v?: string) => {
 		const raw = String(v ?? "").replace(/\r?\n\s*/g, "\n  ").trim();
-		return raw || "（空）";
+		if (!raw) return "（空）";
+		return raw.length > 120 ? `${raw.slice(0, 120)}…` : raw;
 	};
 	const lines: string[] = [];
 	for (const [k, v] of entries) {
