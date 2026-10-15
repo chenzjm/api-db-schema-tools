@@ -59,6 +59,8 @@ function loadXxlBundle(extraDir) {
     for (const d of dirs) {
       try {
         const p = path.join(d, 'xxljob-bundle.cjs');
+        // 先确认存在再读：electron.asar 这类伪目录上 readFileSync 会抛出误导性的错误
+        if (!fs.existsSync(p)) { log.push('eval ' + d + ': 没有 xxljob-bundle.cjs'); continue; }
         const src = fs.readFileSync(p, 'utf-8');
         const mod = evalXxlSource(src, d);
         log.push('eval(' + p + '): 成功');
@@ -67,6 +69,18 @@ function loadXxlBundle(extraDir) {
     }
   }
   return { mod: null, log };
+}
+// Obsidian 里插件 main.js 的 __dirname 是 electron.asar/renderer（不是插件目录），
+// 相对 require 也解析不到（require stack: electron/js2c/renderer_init），
+// manifest.dir 又只是 vault 相对路径——唯一可靠坐标是 vault 绝对路径 + manifest.dir。
+function xxlAbsolutePluginDir(plugin) {
+  try {
+    const dir = plugin && plugin.manifest && plugin.manifest.dir;
+    if (!dir) return '';
+    const adapter = plugin.app && plugin.app.vault && plugin.app.vault.adapter;
+    const base = adapter && typeof adapter.getBasePath === 'function' ? adapter.getBasePath() : '';
+    return base ? path.join(base, dir) : dir;
+  } catch (e) { return ''; }
 }
 function bootXxl(extraDir) {
   const r = loadXxlBundle(extraDir);
@@ -918,8 +932,12 @@ class DemoRestoreModal extends Modal {
 
 class SchemaToolsPlugin extends Plugin {
   async onload() {
-    // 顶层加载若因 __dirname/module.filename 异常失败，这里用 manifest.dir 再试一次
-    if (!xxl && this.manifest && this.manifest.dir) bootXxl(this.manifest.dir);
+    // 顶层 boot 在 Obsidian 里注定失败（__dirname 指向 electron.asar/renderer）。
+    // 这里用 vault 绝对路径 + manifest.dir 拼出插件真实目录再试一次。
+    if (!xxl) {
+      const absDir = xxlAbsolutePluginDir(this);
+      if (absDir) bootXxl(absDir);
+    }
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
     this.schemaState = { version: 1, updatedAt: '', records: {} };
     await this.loadSchemaState();
@@ -2754,5 +2772,5 @@ function countStatuses(diff){const c={added:0,changed:0,unchanged:0,removed:0};f
 function labelStatus(s){return {added:'新增',changed:'变化',unchanged:'未变',removed:'消失'}[s]||s;}
 function changeSummary(d){if(!d||d.status!=='changed')return '';return '变更：'+d.changes.map(k=>`${k} ${JSON.stringify(d.before?.[k]??'')} → ${JSON.stringify(d.after?.[k]??'')}`).join('；');}
 
-SchemaToolsPlugin._test = { core, DDL_DIALECTS, DEFAULTS, xxlLoaded: () => !!xxl, XXL_DIRS, XXL_CLASS_BY_LEVEL, XXL_STATE_FILENAME, xxlSettings, xxlStatePathFor, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell };
+SchemaToolsPlugin._test = { core, DDL_DIALECTS, DEFAULTS, xxlLoaded: () => !!xxl, xxlBoot: bootXxl, xxlAbsDir: xxlAbsolutePluginDir, xxlLog: () => xxlLoadLog, XXL_DIRS, XXL_CLASS_BY_LEVEL, XXL_STATE_FILENAME, xxlSettings, xxlStatePathFor, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell };
 module.exports = SchemaToolsPlugin;
