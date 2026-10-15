@@ -1863,6 +1863,434 @@ function parseDdlWithDialect(sql, dialectId) {
   return adapter.parse(sql);
 }
 
+// --- 字段表 ⇄ 表文档「## 建表语句」同步（自 v0.7.21 / v0.7.22 分支移植） ---------
+// 这一层全是纯函数：不碰 vault、不碰 UI，只做「章节代码块定位」与「补丁式重建 DDL」。
+// 设计要点（与对端一致，勿改）：
+//   1. 补丁式重建而非整段重写 —— 列定义只在「类型 / 可为空 / 默认值」真不同时才重生成，
+//      其余逐字节复用原文（含对齐空格、内联约束、USING INDEX 之类的存储子句）。
+//      ⇒ 「什么都没改」时 buildDdlFromColumns 的输出 === 输入（幂等基准，有回归守护）。
+//   2. 注释只补不改 —— 人工润色过的「说明」与 DDL 原始注释几乎必然不同，覆盖即毁人工成果。
+//   3. 索引只补不改不删 —— 仅回收本插件按 IDX_<表>_<列> 规则命名的索引，人工索引一律不动。
+//   4. 解析不出该表时直接放弃（reason: parse-error），宁可不改也不能改坏。
+// 接线（设置项 / vault 事件 / 命令）见后续批次，这里只提供能力。
+function escapeRe(s) { return String(s == null ? '' : s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+// 把 `## {heading}`（任意层级）章节下的**第一个围栏代码块**整块替换为 ```{lang}\n{code}\n```。
+// 用途：模板里的「## 建表语句」「## 请求示例」「## 响应示例」都是唯一的占位代码块，
+// 导入时把真实内容同步进去。章节或代码块缺失时**返回原文**，不擅自往文档里塞新结构。
+function upsertSectionCodeBlock(markdown, heading, lang, code) {
+  const text = String(markdown == null ? '' : markdown);
+  const value = String(code == null ? '' : code).trim();
+  if (!value) return text;
+  const head = new RegExp('^(#{1,6})[ \\t]*' + escapeRe(heading) + '[ \\t]*$', 'm').exec(text);
+  if (!head) return text;
+  const level = head[1].length;
+  const after = head.index + head[0].length;
+  // 章节范围：到下一个「同级或更高级」标题为止（`## 请求示例` 会被 `# 响应字段说明` 截断）。
+  const next = new RegExp('^#{1,' + level + '}[ \\t]', 'm').exec(text.slice(after));
+  const end = next ? after + next.index : text.length;
+  const section = text.slice(after, end);
+  const block = /^([ \t]*)(`{3,}|~{3,})[^\n]*\n[\s\S]*?\n?[ \t]*\2[ \t]*$/m.exec(section);
+  if (!block) return text;
+  const at = after + block.index;
+  const indent = block[1];
+  const replacement = indent + '```' + String(lang || '') + '\n' + value + '\n' + indent + '```';
+  return text.slice(0, at) + replacement + text.slice(at + block[0].length);
+}
+// `upsertSectionCodeBlock` 的配对方：读出 `## {heading}` 章节里**第一个围栏代码块**的内容。
+// 用途：表文档「## 建表语句」→ 反向解析成字段；与写入侧共用同一套章节定位规则，保证读写对称。
+function readSectionCodeBlock(markdown, heading) {
+  const text = String(markdown == null ? '' : markdown);
+  const head = new RegExp('^(#{1,6})[ \\t]*' + escapeRe(heading) + '[ \\t]*$', 'm').exec(text);
+  if (!head) return '';
+  const level = head[1].length;
+  const after = head.index + head[0].length;
+  const next = new RegExp('^#{1,' + level + '}[ \\t]', 'm').exec(text.slice(after));
+  const end = next ? after + next.index : text.length;
+  const section = text.slice(after, end);
+  const block = /^([ \t]*)(`{3,}|~{3,})[^\n]*\n([\s\S]*?)\n?[ \t]*\2[ \t]*$/m.exec(section);
+  return block ? String(block[3] || '').trim() : '';
+}
+// 反向同步时猜表文档里 SQL 的方言。本库既有 SQL\*Plus 导出的 Oracle 脚本，也可能粘 MySQL DDL，
+// 所以按特征打分而不是只看一个关键字；两边都没特征时按库默认的 Oracle 处理。
+function detectDdlDialect(sql) {
+  const text = String(sql == null ? '' : sql);
+  if (!text.trim()) return 'oracle';
+  let oracle = 0, mysql = 0;
+  if (/^[ \t]*\/[ \t]*$/m.test(text)) oracle += 3;                        // SQL*Plus 的 `/` 结束符
+  if (/\b(?:N?VARCHAR2|NCLOB|BINARY_DOUBLE|RAW)\b/i.test(text)) oracle += 2;
+  if (/\bCOMMENT\s+ON\s+(?:TABLE|COLUMN)\b/i.test(text)) oracle += 2;
+  if (/\bNUMBER\s*\(/i.test(text)) oracle += 1;
+  if (/\bENABLE\b/i.test(text)) oracle += 1;
+  if (/`/.test(text)) mysql += 3;                                          // 反引号标识符
+  if (/\bENGINE\s*=/i.test(text)) mysql += 2;
+  if (/\bAUTO_INCREMENT\b/i.test(text)) mysql += 2;
+  if (/\b(?:TINYINT|MEDIUMINT|DATETIME|LONGTEXT|DOUBLE)\b/i.test(text)) mysql += 1;
+  if (/\)[^()\n]*COMMENT\s+'/i.test(text)) mysql += 2;                     // 列内联 COMMENT '…'
+  return mysql > oracle ? 'mysql' : 'oracle';
+}
+
+// ---------- 字段表 → 表文档「## 建表语句」（v0.7.22） ----------
+// 与「文档 → 字段」相反的方向：**字段表是源**。
+// 关键设计是**补丁式重建**而不是整段重写：列定义只在「数据类型 / 可为空 / 默认值」
+// 真的不同时才重新生成，其余列**原样保留原文本**（含对齐空格、SQL*Plus 生成的
+// `constraint SYS_C0050515 check ("X" IS NOT NULL)` 这类内联约束）。所以「什么都没改」
+// 时重建结果逐字节等于原文 —— 同步天然幂等，也不会出现"改一列、整段格式跳一次"。
+// 注释（COMMENT ON COLUMN）**只补不改**：本库里人工润色过的「说明」与 DDL 原始注释
+// 几乎必然不同（加句号、改括号、加反引号），覆盖回去等于毁掉人工成果。
+// 索引同样**只增不改不删**：`索引: false` 是"未标记"而不是"明确无索引"，
+// 只有 `索引: true` 才是明确意图，才值得补一条 CREATE INDEX。
+
+// 按顶层分隔符（默认逗号）把 [from,to) 切成区间列表，保留每个片段的原始下标。
+// 与 core.splitTopLevel 的区别：那个只返回文本，这个要拿位置才能做补丁替换。
+function splitTopLevelRanges(text, from, to, delimiter = ',') {
+  const out = [];
+  let start = from, depth = 0, quote = null, escaped = false;
+  for (let i = from; i < to; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (escaped) { escaped = false; continue; }
+      if (ch === '\\') { escaped = true; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '\'' || ch === '"' || ch === '`') { quote = ch; continue; }
+    if (ch === '(') depth++;
+    else if (ch === ')') depth = Math.max(0, depth - 1);
+    else if (ch === delimiter && depth === 0) { out.push([start, i]); start = i + 1; }
+  }
+  out.push([start, to]);
+  return out;
+}
+
+// 定位 CREATE TABLE 主体：返回各列表项（列定义 / 表级约束）的原文区间与文本。
+// 不做语法解析，只做引号感知的括号配平与顶层逗号切分 —— 因为重建要**原样复用**原文片段。
+function scanCreateTable(sqlText, table) {
+  const sql = String(sqlText == null ? '' : sqlText);
+  const target = String(table == null ? '' : table).trim().toLowerCase();
+  if (!sql || !target) return null;
+  const re = /create\s+table\s+(?:if\s+not\s+exists\s+)?/ig;
+  let m;
+  while ((m = re.exec(sql))) {
+    // 收集限定名 token（可能形如 "CAPITAL"."T" / `db`.`t` / T），直到左括号。
+    let i = re.lastIndex, token = '', found = false;
+    while (i < sql.length) {
+      const ch = sql[i];
+      if (ch === '(') { found = true; break; }
+      if (!/[\s"`\[\]\w$#.]/.test(ch)) break;
+      token += ch; i++;
+    }
+    if (!found) continue;
+    const segs = token.trim().replace(/["`\[\]]/g, '').split('.').filter(Boolean);
+    if (!segs.length || segs[segs.length - 1].toLowerCase() !== target) continue;
+    const openParen = i;
+    let depth = 1, quote = null, escaped = false, j = openParen + 1;
+    for (; j < sql.length && depth > 0; j++) {
+      const ch = sql[j];
+      if (quote) {
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '\'' || ch === '"' || ch === '`') { quote = ch; continue; }
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+    }
+    if (depth !== 0) continue;
+    const closeParen = j - 1;
+    const items = [];
+    for (const [a, b] of splitTopLevelRanges(sql, openParen + 1, closeParen)) {
+      const raw = sql.slice(a, b);
+      if (!raw.trim()) continue;
+      const trimmed = raw.trim();
+      const head = /^(?:constraint\s+)?(?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|([\w$#]+))/.exec(trimmed);
+      const name = (head && (head[1] || head[2] || head[3] || head[4])) || '';
+      const isConstraint = /^(?:constraint\b|primary\s+key\b|unique\b|check\b|foreign\s+key\b|key\b|index\b|fulltext\b|spatial\b)/i.test(trimmed);
+      items.push({ start: a, end: b, kind: isConstraint ? 'constraint' : 'column', name, text: trimmed });
+    }
+    // 列项首行缩进（原文风格，通常是 4 个空格）；续行缩进在 item.text 内部原样保留。
+    const rawOf = (it) => sql.slice(it.start, it.end);
+    let indent = '    ';
+    const firstColumn = items.find((x) => x.kind === 'column');
+    if (firstColumn) {
+      const rawFirst = rawOf(firstColumn);
+      const lead = /^\s*\n([ \t]*)/.exec(rawFirst) || /^([ \t]+)\S/.exec(rawFirst);
+      if (lead) indent = lead[1];
+    }
+    // 还原原文的排版风格：`(` 与首项之间的空白（有的 dump 把首列写在 `(` 同一行）、
+    // 相邻项之间的分隔空白、末项与 `)` 之间的空白。不记这些，重建会把
+    // `(\t"DATE_TIME" …` 硬改成 `(\n\t"DATE_TIME" …`，逐字节幂等就没了。
+    const leadOf = (it) => (/^\s*/.exec(rawOf(it)) || [''])[0];
+    const trailOf = (it) => (/\s*$/.exec(rawOf(it)) || [''])[0];
+    const headGap = items.length ? leadOf(items[0]) : '\n';
+    const sep = items.length >= 2 ? (leadOf(items[1]) || '\n' + indent) : ('\n' + indent);
+    const tailGap = items.length ? trailOf(items[items.length - 1]) : '\n';
+    // 建表语句的结束符（SQL*Plus 的 `/` 或普通 `;`）：新增注释/索引时沿用同一风格。
+    let termEnd = closeParen + 1;
+    while (termEnd < sql.length && /[ \t]/.test(sql[termEnd])) termEnd++;
+    if (sql[termEnd] === '/' || sql[termEnd] === ';') termEnd++;
+    const hasSlashTerminator = /^[ \t]*\/[ \t]*$/m.test(sql);
+    return { openParen, closeParen, termEnd, tableToken: token.trim(), segments: segs, indent, headGap, sep, tailGap, items, hasSlashTerminator };
+  }
+  return null;
+}
+
+// 渲染一条列定义。Oracle 沿用本库 dump 的顺序（类型 → default → not null）；
+// MySQL 用反引号标识符 + 内联 COMMENT。
+function renderColumnDef(name, col, dialect, padWidth) {
+  const desc = String((col && col.desc) || '').trim();
+  const def = String((col && col.default_value) || '').trim();
+  if (dialect === 'mysql') {
+    // 反引号占 2 个字符，对齐时按显示宽度补。
+    const parts = ['`' + name + '`' + ' '.repeat(Math.max(0, padWidth - String(name).length - 1))];
+    parts.push(String((col && col.data_type) || 'TEXT'));
+    if (col && col.nullable === false) parts.push('NOT NULL');
+    if (def) parts.push('DEFAULT ' + def);
+    if (desc) parts.push(`COMMENT '${desc.replace(/'/g, "''")}'`);
+    return parts.join(' ');
+  }
+  const parts = [String(name).padEnd(padWidth, ' '), String((col && col.data_type) || 'VARCHAR2(1)')];
+  if (def) parts.push('default ' + def);
+  if (col && col.nullable === false) parts.push('not null');
+  return parts.join(' ');
+}
+
+// 补丁式重建：以文档里现有 SQL 为基底，只把「字段表与 SQL 不一致」的地方改掉。
+// 返回 { ok, reason, sql, stats }；stats 用于给用户生成提示。
+function buildDdlFromColumns(opts) {
+  const o = opts || {};
+  const sql = String(o.sql == null ? '' : o.sql);
+  const table = String(o.table || '').trim();
+  const dialect = o.dialect === 'mysql' ? 'mysql' : 'oracle';
+  const columns = Array.isArray(o.columns) ? o.columns : [];
+  const stats = { added: 0, changed: 0, removed: 0, commentsAdded: 0, indexesAdded: 0, primaryKey: 'unchanged' };
+  if (!sql.trim()) return { ok: false, reason: 'empty', sql, stats };
+  if (!table) return { ok: false, reason: 'no-table', sql, stats };
+  if (!columns.length) return { ok: false, reason: 'no-columns', sql, stats };
+  const scan = scanCreateTable(sql, table);
+  if (!scan) return { ok: false, reason: 'no-create-table', sql, stats };
+
+  // 权威现状取自解析器（类型归一、check(IS NOT NULL) → nullable=false 等判定都在那里）。
+  let curTable = null;
+  try {
+    curTable = parseDdlWithDialect(sql, dialect).find((t) => String(t.table || '').toLowerCase() === table.toLowerCase()) || null;
+  } catch (e) { /* 解析失败时退化为"全部重生成"，仍能用字段表产出合法 DDL */ }
+  const curByName = new Map();
+  if (curTable) for (const c of curTable.columns) curByName.set(String(c.name).toUpperCase(), c);
+  // 解析不出这张表时**一律放弃**：否则所有列都会走"重新生成"分支，把原文本
+  // （内联约束、对齐、索引）整段冲掉。宁可不改，也不能改坏。
+  if (!curByName.size) return { ok: false, reason: 'parse-error', sql, stats };
+
+  const normType = (s) => String(s || '').toUpperCase().replace(/\s+/g, '');
+  const normText = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  const originItems = scan.items.filter((x) => x.kind === 'column');
+  const constraintItems = scan.items.filter((x) => x.kind === 'constraint');
+  const itemByName = new Map(originItems.map((it) => [String(it.name).toUpperCase(), it]));
+  // 原表用带引号的标识符（`"DATE_TIME"`）时，重生成的列也要带引号 —— 否则同一张表里
+  // 一半带引号一半不带，看起来像两拨人写的。
+  const anyQuoted = originItems.some((it) => /^"/.test(it.text));
+
+  // 目标顺序：原文已有列保持原来的先后，新列按列名排序追加到末尾。
+  const orderOf = new Map(originItems.map((it, i) => [String(it.name).toUpperCase(), i]));
+  const target = columns.map((c) => ({
+    name: String(c.name),
+    data_type: String(c.data_type == null ? '' : c.data_type),
+    nullable: c.nullable !== false,
+    primary_key: !!c.primary_key,
+    indexed: !!c.indexed,
+    default_value: c.default_value == null ? '' : String(c.default_value),
+    desc: c.desc == null ? '' : String(c.desc),
+  }));
+  target.sort((a, b) => {
+    const ka = a.name.toUpperCase(), kb = b.name.toUpperCase();
+    const ia = orderOf.has(ka) ? orderOf.get(ka) : Number.MAX_SAFE_INTEGER;
+    const ib = orderOf.has(kb) ? orderOf.get(kb) : Number.MAX_SAFE_INTEGER;
+    if (ia !== ib) return ia - ib;
+    return ka.localeCompare(kb);
+  });
+  const padWidth = Math.max(1, ...[...target.map((c) => c.name), ...originItems.map((it) => it.name)].map((s) => String(s).length)) + 1;
+
+  // --- 列定义 ---
+  const outColumns = [], outColumnSrc = [];
+  for (const c of target) {
+    const key = c.name.toUpperCase();
+    const item = itemByName.get(key);
+    const cur = curByName.get(key);
+    let text = null;
+    if (item && cur) {
+      const same = normType(cur.data_type) === normType(c.data_type)
+        && !!cur.nullable === !!c.nullable
+        && normText(cur.default_value) === normText(c.default_value);
+      if (same) text = item.text;           // 原样保留（含内联约束 / 对齐 / 大小写）
+      else stats.changed++;
+    } else if (!item) {
+      // 解析器认得出的列却找不到条目（原文写法罕见）→ 算"更新"而非"新增"。
+      if (curByName.has(key)) stats.changed++; else stats.added++;
+    }
+    if (!text) {
+      const quoted = item ? /^"/.test(item.text) : anyQuoted;
+      text = renderColumnDef(quoted ? `"${c.name}"` : c.name, c, dialect, padWidth + (quoted ? 2 : 0));
+    }
+    outColumns.push(text);
+    outColumnSrc.push(item || null);
+  }
+  // DDL 里有、字段表里没有的列 → 连同它的列块一起消失。
+  const targetKeys = new Set(target.map((c) => c.name.toUpperCase()));
+  const dropped = originItems.filter((it) => !targetKeys.has(String(it.name).toUpperCase()));
+  stats.removed = dropped.length;
+
+  // --- 主键约束（表级） ---
+  const pkColumns = target.filter((c) => c.primary_key).map((c) => c.name);
+  const pkItem = constraintItems.find((it) => /primary\s+key/i.test(it.text)) || null;
+  let pkText = null;
+  if (pkColumns.length) {
+    // 主键也走"最小改动"：列集合一致就**原样保留整条约束**，包括
+    // `USING INDEX PCTFREE … ENABLE` 这类工具生成、本插件无法凭空重建的子句。
+    // 列集合变了只替换 `(…)` 里的列表，约束名与后续子句一律不动。
+    const pkMatch = pkItem && /primary\s+key\s*\(([^)]*)\)/i.exec(pkItem.text);
+    const quoted = !!(pkMatch && /"/.test(pkMatch[1]));
+    const pkList = () => (quoted ? pkColumns.map((c) => `"${c}"`) : pkColumns).join(', ');
+    if (pkMatch) {
+      const curPk = core.splitTopLevel(pkMatch[1]).map((x) => x.trim().replace(/["`\[\]]/g, '').toUpperCase());
+      const wantPk = pkColumns.map((c) => c.toUpperCase());
+      if (curPk.join(',') === wantPk.join(',')) {
+        pkText = pkItem.text;
+      } else {
+        const at = pkMatch.index + pkMatch[0].indexOf('(');
+        pkText = pkItem.text.slice(0, at) + '(' + pkList() + ')' + pkItem.text.slice(at + 2 + pkMatch[1].length);
+        stats.primaryKey = 'updated';
+      }
+    } else if (pkItem) {
+      pkText = pkItem.text;               // 认不出列列表，别乱动
+    } else {
+      pkText = `constraint PK_${table.toUpperCase().slice(0, 24)} primary key (${pkList()})`;
+      stats.primaryKey = 'added';
+    }
+  } else if (pkItem) {
+    stats.primaryKey = 'removed';
+  }
+
+  // 约束项保持原文相对顺序：主键在它原来的位置上被替换，其它约束原样收进来。
+  // 每项都记着它来自原文的哪一段，重建时逐项沿用**原文自己的**缩进 —— Oracle dump
+  // 常把约束项缩进得比列项多一个空格，统一缩进就会逐字节不一致。
+  const bodyItems = outColumns.map((t, i) => ({ text: t, item: outColumnSrc[i] }));
+  for (const it of constraintItems) {
+    if (it === pkItem) { if (pkText) bodyItems.push({ text: pkText, item: it }); continue; }
+    bodyItems.push({ text: it.text, item: it });
+  }
+  if (pkText && !pkItem) bodyItems.push({ text: pkText, item: null });
+  const leadOfItem = (it) => (/^\s*/.exec(sql.slice(it.start, it.end)) || [''])[0];
+  const parts = bodyItems.map((x) => (x.item ? leadOfItem(x.item) : '\n' + scan.indent) + x.text);
+  if (parts.length) parts[0] = scan.headGap + bodyItems[0].text;   // 首项的空白由 headGap 提供
+  const body = parts.join(',') + scan.tailGap;
+
+  // --- 注释（Oracle 才有独立的 COMMENT ON COLUMN；MySQL 走列内联） ---
+  const edits = [{ start: scan.openParen + 1, end: scan.closeParen, text: body }];
+  if (dialect !== 'mysql') {
+    const haveCols = new Set();
+    const cmtRe = /comment\s+on\s+column\s+([\w$#".]+)\s*\.\s*([\w$#"]+)\s+is\s+'/gim;
+    let cm;
+    while ((cm = cmtRe.exec(sql))) haveCols.add(cm[2].replace(/"/g, '').toUpperCase());
+    const need = target.filter((c) => String(c.desc).trim() && !haveCols.has(c.name.toUpperCase()));
+    stats.commentsAdded = need.length;
+    if (need.length) {
+      // 只增不改：接在最后一条 COMMENT 之后（没有就接在建表语句的结束符之后）。
+      let anchor = scan.termEnd;
+      const tailRe = /comment\s+on\s+(?:column|table)\s+[\w$#".\s]+\s+is\s+'(?:''|[^'])*'\s*(?:;|\/)?/gim;
+      let last = null, tm;
+      while ((tm = tailRe.exec(sql))) if (!last || (tm.index + tm[0].length) > (last.index + last[0].length)) last = tm;
+      if (last) anchor = last.index + last[0].length;
+      const term = scan.hasSlashTerminator ? '\n/' : ';';
+      const stmts = need.map((c) => `comment on column ${scan.tableToken}.${c.name} is '${String(c.desc).trim().replace(/'/g, "''")}'`);
+      edits.push({ start: anchor, end: anchor, text: '\n' + stmts.map((s) => s + term).join('\n') + '\n' });
+    }
+    // 列块被移除时，它的 COMMENT 也一并删掉，否则文档里会留下指向不存在列的孤儿注释。
+    // （只对"字段表里确实少了这一列"生效 —— 列文件整体不完整的情况已被上层安全闸拦住。）
+    const droppedNames = new Set(dropped.map((it) => String(it.name).toUpperCase()));
+    if (droppedNames.size) {
+      const delRe = /^[ \t]*comment\s+on\s+column\s+(?:[\w$#"]+\s*\.\s*)*("[^"]+"|`[^`]+`|[\w$#]+)\s+is\s+'(?:''|[^'])*'[ \t]*(?:;|\/)?[ \t]*\r?\n?/gim;
+      let dm;
+      while ((dm = delRe.exec(sql))) {
+        if (!droppedNames.has(dm[1].replace(/["`\[\]]/g, '').toUpperCase())) continue;
+        edits.push({ start: dm.index, end: dm.index + dm[0].length, text: '' });
+      }
+    }
+  }
+
+  // --- 索引：补缺少的；回收"本插件按命名规则生成、且已不再需要"的那几条 ---
+  // 人工写的索引（名字各式各样）一律不动；`索引: false` 只代表"没标"，不代表"要删"。
+  const covered = new Set();
+  const ownIdx = [];   // 原文里由本插件命名的索引语句（可能本轮要回收）
+  const abbrUpper = table.toUpperCase().split('_').map((x) => x[0] || '').join('');
+  const ownNames = new Set();
+  for (const c of target) {
+    const col = c.name.toUpperCase();
+    ownNames.add(`IDX_${table.toUpperCase()}_${col}`.replace(/[^\w$#]/g, '_'));
+    ownNames.add(`IDX_${abbrUpper}_${col}`.replace(/[^\w$#]/g, '_'));
+  }
+  const idxRe = /create\s+(?:unique\s+)?index\s+([\w$#".]+)\s+on\s+([\w$#".]+)\s*\(([^)]*)\)\s*(?:;|\/)?/gim;
+  let im;
+  while ((im = idxRe.exec(sql))) {
+    const seg = String(im[2]).replace(/["`\[\]]/g, '').split('.').filter(Boolean);
+    if (seg.length && seg[seg.length - 1].toLowerCase() !== table.toLowerCase()) continue;
+    for (const col of core.splitTopLevel(im[3])) covered.add(col.trim().replace(/\s+(?:asc|desc)$/i, '').replace(/["`\[\]]/g, '').toUpperCase());
+    const nm = String(im[1]).replace(/["`\[\]]/g, '').toUpperCase();
+    const cols = core.splitTopLevel(im[3]).map((x) => x.trim().replace(/\s+(?:asc|desc)$/i, '').replace(/["`\[\]]/g, '').toUpperCase());
+    // 只认"名字严格等于 IDX_<表全名>_<列> / IDX_<表缩写>_<列>、且单列覆盖"的索引 —— 命名足够特定，
+    // 不会误命中人工索引（实测本库三个索引名都不匹配）。
+    if (ownNames.has(nm) && cols.length === 1) ownIdx.push({ name: nm, col: cols[0], start: im.index, len: im[0].length });
+  }
+  const noLongerNeeded = (col) => {
+    const c = target.find((x) => x.name.toUpperCase() === col);
+    return !c || !c.indexed || c.primary_key;    // 列没了 / 取消勾选 / 变成主键 → 不再需要这条索引
+  };
+  if (dialect !== 'mysql') {
+    for (const o of ownIdx) {
+      if (!noLongerNeeded(o.col)) continue;
+      let s0 = o.start;
+      while (s0 > 0 && sql[s0 - 1] !== '\n') s0--;                 // 回退到该语句的行首
+      let e0 = o.start + o.len;
+      if (sql.startsWith('\r\n', e0)) e0 += 2; else if (sql[e0] === '\n') e0 += 1;
+      edits.push({ start: s0, end: e0, text: '' });
+      covered.delete(o.col);
+    }
+  }
+  for (const it of constraintItems) {
+    if (!/^(?:key|index|unique\s+key|fulltext\b|spatial\b)/i.test(it.text)) continue;
+    const cols = /\(([^)]*)\)/.exec(it.text);
+    if (cols) for (const col of core.splitTopLevel(cols[1])) covered.add(col.trim().replace(/\s+(?:asc|desc)$/i, '').replace(/["`\[\]]/g, '').toUpperCase());
+  }
+  const needIdx = target.filter((c) => c.indexed && !c.primary_key && !covered.has(c.name.toUpperCase()));
+  if (needIdx.length && dialect !== 'mysql') {
+    stats.indexesAdded = needIdx.length;
+    let anchor = scan.termEnd;
+    const tailIdxRe = /create\s+(?:unique\s+)?index\s+[\w$#".]+\s+on\s+[\w$#".]+\s*\([^)]*\)\s*(?:;|\/)?/gim;
+    let last = null, tm;
+    while ((tm = tailIdxRe.exec(sql))) if (!last || (tm.index + tm[0].length) > (last.index + last[0].length)) last = tm;
+    if (last) anchor = last.index + last[0].length;
+    const term = scan.hasSlashTerminator ? '\n/' : ';';
+    const stmts = needIdx.map((c) => {
+      const col = c.name.toUpperCase();
+      const full = table.toUpperCase();
+      let nm = `IDX_${full}_${col}`.replace(/[^\w$#]/g, '_');
+      if (nm.length > 30) {
+        // Oracle 老版本标识符上限 30。先缩表名（CIPA 这类首字母缩写，与库里既有索引风格一致），
+        // 列名是辨识度所在，尽量保住。
+        const abbr = full.split('_').map((x) => x[0] || '').join('');
+        nm = `IDX_${abbr}_${col}`.replace(/[^\w$#]/g, '_');
+      }
+      if (nm.length > 30) nm = nm.slice(0, 30);
+      return `create index ${nm}\n    on ${scan.tableToken} (${c.name})`;
+    });
+    edits.push({ start: anchor, end: anchor, text: '\n' + stmts.map((s) => s + term).join('\n') + '\n' });
+  }
+
+  edits.sort((a, b) => b.start - a.start);
+  let out = sql;
+  for (const e of edits) out = out.slice(0, e.start) + e.text + out.slice(e.end);
+  return { ok: true, sql: out, stats, changed: out !== sql };
+}
+
 // --- Schema Studio --------------------------------------------------------
 
 class SchemaStudioModal extends Modal {
@@ -2808,5 +3236,5 @@ function countStatuses(diff){const c={added:0,changed:0,unchanged:0,removed:0};f
 function labelStatus(s){return {added:'新增',changed:'变化',unchanged:'未变',removed:'消失'}[s]||s;}
 function changeSummary(d){if(!d||d.status!=='changed')return '';return '变更：'+d.changes.map(k=>`${k} ${JSON.stringify(d.before?.[k]??'')} → ${JSON.stringify(d.after?.[k]??'')}`).join('；');}
 
-SchemaToolsPlugin._test = { core, DDL_DIALECTS, DEFAULTS, xxlLoaded: () => !!xxl, xxlBoot: bootXxl, xxlAbsDir: xxlAbsolutePluginDir, xxlLog: () => xxlLoadLog, XXL_DIRS, XXL_CLASS_BY_LEVEL, XXL_STATE_FILENAME, xxlSettings, xxlStatePathFor, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell };
+SchemaToolsPlugin._test = { core, DDL_DIALECTS, DEFAULTS, xxlLoaded: () => !!xxl, xxlBoot: bootXxl, xxlAbsDir: xxlAbsolutePluginDir, xxlLog: () => xxlLoadLog, XXL_DIRS, XXL_CLASS_BY_LEVEL, XXL_STATE_FILENAME, xxlSettings, xxlStatePathFor, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell, escapeRe, upsertSectionCodeBlock, readSectionCodeBlock, detectDdlDialect, splitTopLevelRanges, scanCreateTable, renderColumnDef, buildDdlFromColumns };
 module.exports = SchemaToolsPlugin;
