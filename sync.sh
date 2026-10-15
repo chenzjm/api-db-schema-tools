@@ -11,7 +11,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VAULT="${VAULT_DIR:-/Users/chenzhongjun/Desktop/文档编辑器/消金业务合作平台/.obsidian/plugins/api-db-schema-tools}"
-FILES=(main.js manifest.json styles.css README.md versions.json)
+FILES=(main.js manifest.json styles.css README.md versions.json xxljob-bundle.cjs)
 
 if [ ! -d "$VAULT" ]; then
   echo "找不到 vault 插件目录：$VAULT" >&2

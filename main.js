@@ -2,6 +2,10 @@
 const {
   Plugin, Modal, Notice, Setting, PluginSettingTab, TFile, EditorSuggest, normalizePath, stringifyYaml, setIcon
 } = require('obsidian');
+// xxl-job XML 导入子模块：由 xxljob-flow-atlas 仓库构建产出（external obsidian）。
+// 没拷进来时整个 xxljob 域自动降级为不可用，不影响接口 / 数据库两条链路。
+let xxl = null;
+try { xxl = require('./xxljob-bundle.cjs'); } catch (e) { console.warn('[Schema Studio] 未加载 xxljob-bundle.cjs，xxl-job 域不可用', e && e.message); }
 const core = (() => {
 function sanitizeSegment(value) {
   return String(value ?? '')
@@ -267,11 +271,39 @@ const DEFAULTS = {
   // 新建表文档时套用的模板；留空则回退到内置的最小结构
   dbDocTemplate: '_template/业务模板/db-数据库-shuju/db-数据库-shuju.md',
   prioritizeInlineSuggest: true,
+  // --- xxl-job XML 导入（子模块 xxljob-flow-atlas） ---
+  xxljobDocsFolder: '8.xxljob',
+  xxljobConflictPolicy: 'skip',
+  xxljobExecutors: [],
+  xxljobFlowTemplate: '_template/业务模板/xxljob-批任务-pirenwu/xxljob-任务流-renwuliu.md',
+  xxljobTaskTemplate: '_template/业务模板/xxljob-批任务-pirenwu/xxljob-批任务-pirenwu.md',
+  xxljobComponentTemplate: '_template/业务模板/xxljob-批任务-pirenwu/xxljob-任务组件-renwuzujian.md',
   gridViewPrefs: {
     api: { hiddenProps: [], sorts: [], filters: [] },
     db: { hiddenProps: [], sorts: [], filters: [] },
   },
 };
+
+// xxl-job 文档的三级目录名（与 xxljob-flow-atlas 的 levelToDirName 一致）
+const XXL_DIRS = { flow: '任务流', task: '任务', component: '任务组件' };
+// 三级目录 → fileClass 名：xxl-job 文档分散在 <根目录>/<执行器>/<层级> 下，
+// 执行器层不固定，没法用 filesPaths 精确匹配，改按 fileClass 名直接找定义。
+const XXL_CLASS_BY_LEVEL = { [XXL_DIRS.flow]: '任务流', [XXL_DIRS.task]: '批任务', [XXL_DIRS.component]: '任务组件' };
+// 与 db 域的 .schema-state.json 分开，避免两套记录的键互相污染
+const XXL_STATE_FILENAME = '.xxljob-state.json';
+function xxlStatePathFor(docsFolder) {
+  return normalizePath(`${normalizePath(docsFolder || '8.xxljob')}/${XXL_STATE_FILENAME}`);
+}
+function xxlSettings(plugin) {
+  return {
+    docsFolder: plugin.settings.xxljobDocsFolder || DEFAULTS.xxljobDocsFolder,
+    conflictPolicy: plugin.settings.xxljobConflictPolicy || DEFAULTS.xxljobConflictPolicy,
+    executors: Array.isArray(plugin.settings.xxljobExecutors) ? plugin.settings.xxljobExecutors : [],
+    flowTemplate: plugin.settings.xxljobFlowTemplate || '',
+    taskTemplate: plugin.settings.xxljobTaskTemplate || '',
+    componentTemplate: plugin.settings.xxljobComponentTemplate || '',
+  };
+}
 
 function bool(v, fallback = false) { return typeof v === 'boolean' ? v : fallback; }
 function arrish(v) { return Array.isArray(v) ? v : (v == null ? [] : [v]); }
@@ -862,41 +894,46 @@ class SchemaToolsPlugin extends Plugin {
   // 运行态（来源方式 / 方言 / 疑似删除 / 最后导入时间）不再寄生在业务文档上，
   // 统一放在字段记录目录同级的 `.schema-state.json`；`疑似删除` 也从这里读。
   schemaStatePath() { return schemaStatePathFor(this.settings.dbColumnsFolder); }
+  // xxl-job 域独立的状态文件：记来源 XML / 原任务 id / 导入时间，不写进业务文档正文
+  xxljobStatePath() { return xxlStatePathFor(this.settings.xxljobDocsFolder || DEFAULTS.xxljobDocsFolder); }
+  async loadXxljobState() { return this.loadSchemaState(this.xxljobStatePath()); }
+  async patchXxljobState(patch) { return this.patchSchemaState(patch, this.xxljobStatePath()); }
   schemaStateFor(filePath) { return this.schemaState?.records?.[normalizePath(filePath)] || null; }
   isSchemaOrphaned(filePath) { return !!this.schemaStateFor(filePath)?.orphaned; }
-  async loadSchemaState() {
-    this.schemaState = { version: 1, updatedAt: '', records: {} };
+  async loadSchemaState(statePath) {
+    const path = statePath || this.schemaStatePath();
+    const empty = { version: 1, updatedAt: '', records: {} };
+    // 只有读「主状态文件」时才覆盖内存态；读别的状态文件（如 xxl-job 的）不能顶掉它
+    if (!statePath) this.schemaState = empty;
+    const out = statePath ? { version: 1, updatedAt: '', records: {} } : this.schemaState;
     try {
-      const path = this.schemaStatePath();
       const file = this.app.vault.getAbstractFileByPath(path);
-      if (!file) return this.schemaState;
+      if (!file) return out;
       const parsed = JSON.parse(await this.app.vault.read(file));
       if (parsed && typeof parsed === 'object') {
-        this.schemaState = {
-          version: parsed.version || 1,
-          updatedAt: parsed.updatedAt || '',
-          records: parsed.records && typeof parsed.records === 'object' ? parsed.records : {},
-        };
+        out.version = parsed.version || 1;
+        out.updatedAt = parsed.updatedAt || '';
+        out.records = parsed.records && typeof parsed.records === 'object' ? parsed.records : {};
       }
     } catch (e) { console.warn('[Schema Studio] 读取状态文件失败，按空状态继续', e); }
-    return this.schemaState;
+    return out;
   }
-  async patchSchemaState(patch) {
+  async patchSchemaState(patch, statePath) {
     if (!patch || !Object.keys(patch).length) return;
-    const state = await this.loadSchemaState();
+    const path = statePath || this.schemaStatePath();
+    const state = await this.loadSchemaState(path);
     for (const [filePath, value] of Object.entries(patch)) {
       const key = normalizePath(filePath);
       state.records[key] = Object.assign({}, state.records[key] || {}, value);
     }
     state.updatedAt = new Date().toISOString();
-    const path = this.schemaStatePath();
     try {
       await ensureFolder(this.app, path.split('/').slice(0, -1).join('/'));
       const body = JSON.stringify(state, null, 2) + '\n';
       const file = this.app.vault.getAbstractFileByPath(path);
       if (file) await this.app.vault.modify(file, body);
       else await this.app.vault.create(path, body);
-      this.schemaState = state;
+      if (!statePath) this.schemaState = state;
     } catch (e) { console.warn('[Schema Studio] 写入状态文件失败', e); }
   }
 
@@ -993,7 +1030,7 @@ class SchemaToolsPlugin extends Plugin {
     }
   }
 
-  findFileClassForFolder(folder) {
+  findFileClassForFolder(folder, fallbackName) {
     const target = normalizePath(folder || '');
     for (const file of this.app.vault.getMarkdownFiles()) {
       const fm = this.app.metadataCache.getFileCache(file)?.frontmatter || {};
@@ -1002,10 +1039,38 @@ class SchemaToolsPlugin extends Plugin {
         return { file, className: basenameNoExt(file.path), fields: fm.fields.map(normalizeFieldDefinition).filter(Boolean) };
       }
     }
+    // 目录不固定（例如 xxl-job 的 8.xxljob/<执行器>/任务）时，按 fileClass 名兜底
+    return fallbackName ? this.findFileClassByName(fallbackName) : null;
+  }
+
+  /** 按 fileClass 名找定义文件：命中「文件名 == 类名且含 fields 定义」的那份 md */
+  findFileClassByName(className) {
+    const name = String(className || '').trim();
+    if (!name) return null;
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (basenameNoExt(file.path) !== name) continue;
+      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter || {};
+      if (!Array.isArray(fm.fields)) continue;
+      return { file, className: name, fields: fm.fields.map(normalizeFieldDefinition).filter(Boolean) };
+    }
     return null;
   }
 
+  /** xxl-job 某层级目录对应的 fileClass 定义（找不到返回 null，不阻塞浏览与导入） */
+  xxljobFileClass(levelDir) {
+    return this.findFileClassByName(XXL_CLASS_BY_LEVEL[levelDir]);
+  }
+
   getFieldDefinitions(domain) {
+    if (domain === 'xxljob') {
+      // xxl-job 是「一份任务一份文档」的三层树，不做字段级 grid 编辑；
+      // 这里只用来让「新建文档」等场景能拿到对应层级的字段定义。
+      const fields = new Map();
+      for (const dirName of [XXL_DIRS.flow, XXL_DIRS.task, XXL_DIRS.component]) {
+        for (const def of this.xxljobFileClass(dirName)?.fields || []) if (!fields.has(def.name)) fields.set(def.name, def);
+      }
+      return { className: 'xxljob', fields: [...fields.values()] };
+    }
     const folder = domain === 'api' ? this.settings.apiFieldsFolder : this.settings.dbColumnsFolder;
     const cls = this.findFileClassForFolder(folder);
     const defs = new Map((cls?.fields || []).map(d => [d.name, d]));
@@ -1082,6 +1147,45 @@ class SchemaToolsSettingTab extends PluginSettingTab {
       .addText(t => t.setValue(this.plugin.settings.dbDocTemplate || '').onChange(async v => {
         this.plugin.settings.dbDocTemplate = v.trim(); await this.plugin.saveSettings();
       }));
+    containerEl.createEl('h3', { text: 'xxl-job XML 导入' });
+    if (!xxl) {
+      containerEl.createEl('p', { text: '未加载 xxljob-bundle.cjs，xxl-job 域不可用。在 xxljob-flow-atlas 仓库执行 ./sync.sh to-vault 后重载插件即可。' });
+    }
+    const xxlFolderFields = [['xxljobDocsFolder', '文档根目录']];
+    for (const [key, name] of xxlFolderFields) {
+      new Setting(containerEl).setName(name).setDesc('生成 任务流 / 批任务 / 任务组件 三级文档的根目录，实际落在 <根目录>/<执行器>/{任务流,任务,任务组件}。')
+        .addText(t => t.setValue(this.plugin.settings[key] ?? DEFAULTS.xxljobDocsFolder).onChange(async v => {
+          this.plugin.settings[key] = v.trim() || DEFAULTS.xxljobDocsFolder; await this.plugin.saveSettings();
+        }));
+    }
+    const xxlTplFields = [
+      ['xxljobFlowTemplate', '任务流文档模板'],
+      ['xxljobTaskTemplate', '批任务文档模板'],
+      ['xxljobComponentTemplate', '任务组件文档模板'],
+    ];
+    for (const [key, name] of xxlTplFields) {
+      new Setting(containerEl).setName(name).setDesc('留空则用内置最小结构。模板的 frontmatter 键顺序会被保留，能推断的填真实值，推断不了的保留 {{填写提示}}。')
+        .addText(t => t.setValue(this.plugin.settings[key] || '').onChange(async v => {
+          this.plugin.settings[key] = v.trim(); await this.plugin.saveSettings();
+        }));
+    }
+    new Setting(containerEl)
+      .setName('重名文档处理')
+      .setDesc('导入时目标路径已存在文档：跳过 / 更新（frontmatter 整体替换、归属章节刷新、手写正文保留）/ 新建副本。')
+      .addDropdown(d => d.addOptions({ skip: '跳过（保留现有文档）', update: '更新（保留手写正文）', rename: '新建副本' })
+        .setValue(this.plugin.settings.xxljobConflictPolicy || DEFAULTS.xxljobConflictPolicy)
+        .onChange(async v => { this.plugin.settings.xxljobConflictPolicy = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl)
+      .setName('执行器清单')
+      .setDesc('每行一个：执行器名称，或 执行器名称|任务分组编号1,编号2。XML 里只有 jobGroup 编号、没有执行器名，靠这份清单匹配；导入确认后会自动回写。')
+      .addTextArea(t => {
+        t.setValue(xxl ? xxl.executorListToText(Array.isArray(this.plugin.settings.xxljobExecutors) ? this.plugin.settings.xxljobExecutors : []) : '');
+        t.onChange(async v => {
+          this.plugin.settings.xxljobExecutors = xxl ? xxl.textToExecutorList(v) : [];
+          await this.plugin.saveSettings();
+        });
+        t.inputEl.rows = 6; t.inputEl.style.width = '100%';
+      });
     new Setting(containerEl)
       .setName('让 @ Schema 联想优先于原生建议')
       .setDesc('默认开启。关闭后 Schema Studio 仍可使用，但 @ 可能被 Obsidian 或其他插件的建议器抢先。该开关也用于排查与 Bases / Fileclass 的兼容性问题。')
@@ -1699,12 +1803,12 @@ class SchemaStudioModal extends Modal {
     for(const edits of this.pendingEdits.values()){const n=Object.keys(edits||{}).length;if(n){records++;cells+=n;}}
     return {records,cells};
   }
-  hasPendingImport(){return (this.page==='json-diff'||this.page==='ddl-diff')&&!!this.importState?.analysis?.length;}
+  hasPendingImport(){return (this.page==='json-diff'||this.page==='ddl-diff'||this.page==='xxljob-diff')&&!!this.importState?.analysis?.length;}
   hasUnsavedChanges(){const p=this.getPendingEditStats();return p.cells>0||this.hasPendingImport();}
   unsavedSummary(){
     const p=this.getPendingEditStats(),parts=[];
     if(p.cells)parts.push(`${p.records} 条记录共 ${p.cells} 处手工修改`);
-    if(this.hasPendingImport())parts.push(this.page==='json-diff'?'JSON 导入对比尚未应用':'DDL 导入对比尚未应用');
+    if(this.hasPendingImport())parts.push(this.page==='json-diff'?'JSON 导入对比尚未应用':this.page==='ddl-diff'?'DDL 导入对比尚未应用':'xxl-job 导入对比尚未应用');
     return parts.join('；')||'存在未保存修改';
   }
   close(){
@@ -1740,6 +1844,7 @@ class SchemaStudioModal extends Modal {
       // built from an older snapshot, the user's latest manual edits must win.
       if(this.page==='json-diff'&&this.importState?.analysis)await this.applyJson(this.importState);
       else if(this.page==='ddl-diff'&&this.importState?.analysis)await this.applyDdl(this.importState);
+      else if(this.page==='xxljob-diff'&&this.importState?.analysis)await this.applyXxljob(this.importState);
       await this.saveAllPendingEdits({render:false,notify:false});
       this.forceClose();
     }catch(error){console.error('[Schema Studio] 保存并关闭失败',error);new Notice(`保存失败：${error?.message||error}`);}
@@ -1748,19 +1853,52 @@ class SchemaStudioModal extends Modal {
   render(){
     this.activeGridEditor=null;
     this.contentEl.empty(); const shell=this.contentEl.createDiv({cls:'schema-studio-shell'}); this.sidebarEl=shell.createDiv({cls:'schema-studio-sidebar'}); this.mainEl=shell.createDiv({cls:'schema-studio-main'}); this.renderSidebar();
-    if(this.page==='json-import')this.renderJsonImport(); else if(this.page==='json-diff')this.renderJsonDiff(); else if(this.page==='ddl-import')this.renderDdlImport(); else if(this.page==='ddl-diff')this.renderDdlDiff(); else this.renderBrowse();
+    if(this.page==='json-import')this.renderJsonImport(); else if(this.page==='json-diff')this.renderJsonDiff(); else if(this.page==='ddl-import')this.renderDdlImport(); else if(this.page==='ddl-diff')this.renderDdlDiff(); else if(this.page==='xxljob-import')this.renderXxljobImport(); else if(this.page==='xxljob-diff')this.renderXxljobDiff(); else this.renderBrowse();
   }
   renderSidebar(){
     const title=this.sidebarEl.createDiv({cls:'schema-studio-brand'});title.createDiv({text:'Schema Studio',cls:'schema-studio-brand-title'});title.createDiv({text:'接口 / 数据库结构管理',cls:'schema-tools-muted'});
-    const tabs=this.sidebarEl.createDiv({cls:'schema-studio-domain-tabs'});this.domainButton(tabs,'api','接口');this.domainButton(tabs,'db','数据库');
-    const importBtn=this.sidebarEl.createEl('button',{text:this.domain==='api'?'+ 导入 / 新建接口':'+ 批量导入 / 更新 DDL',cls:'schema-studio-import-button mod-cta'});importBtn.onclick=()=>{this.page=this.domain==='api'?'json-import':'ddl-import';this.importState=null;this.render();};
+    const tabs=this.sidebarEl.createDiv({cls:'schema-studio-domain-tabs'});this.domainButton(tabs,'api','接口');this.domainButton(tabs,'db','数据库');this.domainButton(tabs,'xxljob','xxl-job');
+    const importBtn=this.sidebarEl.createEl('button',{text:this.domain==='api'?'+ 导入 / 新建接口':this.domain==='db'?'+ 批量导入 / 更新 DDL':'+ 导入 xxl-job XML',cls:'schema-studio-import-button mod-cta'});importBtn.onclick=()=>{this.page=this.domain==='api'?'json-import':this.domain==='db'?'ddl-import':'xxljob-import';this.importState=null;this.render();};
     const search=this.sidebarEl.createEl('input',{type:'search',placeholder:'筛选…',cls:'schema-studio-nav-search'});const list=this.sidebarEl.createDiv({cls:'schema-studio-nav-list'});
-    const draw=()=>{list.empty();const q=search.value.trim().toLowerCase();const items=this.domain==='api'?this.getApiGroups():this.getDbGroups();items.filter(x=>!q||x.label.toLowerCase().includes(q)).forEach(item=>{const row=list.createDiv({cls:`schema-studio-nav-item${this.selectedKey===item.key&&this.page==='browse'?' is-active':''}`});row.createDiv({text:item.label,cls:'schema-studio-nav-title'});row.createDiv({text:item.detail,cls:'schema-tools-muted'});row.onclick=()=>{this.selectedKey=item.key;this.page='browse';this.render();};});if(!items.length)list.createDiv({text:'暂无数据',cls:'schema-tools-muted schema-studio-empty'});};search.oninput=draw;draw();
+    const draw=()=>{list.empty();const q=search.value.trim().toLowerCase();const items=this.domain==='api'?this.getApiGroups():this.domain==='db'?this.getDbGroups():this.getXxljobGroups();items.filter(x=>!q||x.label.toLowerCase().includes(q)).forEach(item=>{const row=list.createDiv({cls:`schema-studio-nav-item${this.selectedKey===item.key&&this.page==='browse'?' is-active':''}`});row.createDiv({text:item.label,cls:'schema-studio-nav-title'});row.createDiv({text:item.detail,cls:'schema-tools-muted'});row.onclick=()=>{this.selectedKey=item.key;this.page='browse';this.render();};});if(!items.length)list.createDiv({text:'暂无数据',cls:'schema-tools-muted schema-studio-empty'});};search.oninput=draw;draw();
   }
   domainButton(parent,domain,label){const btn=parent.createEl('button',{text:label,cls:this.domain===domain?'is-active':''});btn.onclick=()=>{this.domain=domain;this.selectedKey=null;this.page='browse';this.importState=null;this.render();};}
   getApiGroups(){const map=new Map();for(const r of this.plugin.scanApiFields()){if(!map.has(r.apiName))map.set(r.apiName,{key:r.apiName,label:r.apiName,rows:[],apiPath:r.apiPath});map.get(r.apiName).rows.push(r);}return [...map.values()].sort((a,b)=>a.label.localeCompare(b.label,'zh-CN')).map(x=>({...x,detail:`${x.rows.filter(r=>!r.schema_orphaned).length} 个节点`}));}
   getDbGroups(){const map=new Map();for(const r of this.plugin.scanDbColumns()){if(!map.has(r.table))map.set(r.table,{key:r.table,label:r.table,rows:[],tablePath:r.tablePath});map.get(r.table).rows.push(r);}return [...map.values()].sort((a,b)=>a.label.localeCompare(b.label)).map(x=>({...x,detail:`${x.rows.filter(r=>!r.schema_orphaned).length} 列`}));}
-  renderBrowse(){this.domain==='api'?this.renderApiBrowse():this.renderDbBrowse();}
+  renderBrowse(){this.domain==='api'?this.renderApiBrowse():this.domain==='db'?this.renderDbBrowse():this.renderXxljobBrowse();}
+  // --- xxl-job 域：按执行器分组，列出 <执行器>/{任务流,任务,任务组件} 下的文档 ---
+  getXxljobGroups(){
+    const root=normalizePath(this.plugin.settings.xxljobDocsFolder||DEFAULTS.xxljobDocsFolder)+'/';const map=new Map();
+    for(const file of this.app.vault.getMarkdownFiles()){
+      if(!file.path.startsWith(root))continue;
+      const parts=file.path.slice(root.length).split('/');
+      if(parts.length<3)continue; // <执行器>/<层级>/<名称>.md
+      const executor=parts[0],level=parts[1];
+      if(level!==XXL_DIRS.flow&&level!==XXL_DIRS.task&&level!==XXL_DIRS.component)continue;
+      if(!map.has(executor))map.set(executor,{key:executor,label:executor,counts:{flow:0,task:0,component:0},files:[]});
+      const g=map.get(executor);g.files.push({file,level,name:basenameNoExt(file.path)});
+      if(level===XXL_DIRS.flow)g.counts.flow++;else if(level===XXL_DIRS.task)g.counts.task++;else g.counts.component++;
+    }
+    return [...map.values()].sort((a,b)=>a.label.localeCompare(b.label,'zh-CN')).map(x=>({...x,detail:`${x.counts.flow} 个任务流 / ${x.counts.task} 个任务 / ${x.counts.component} 个组件`}));
+  }
+  renderXxljobBrowse(){
+    const groups=this.getXxljobGroups(),folder=this.plugin.settings.xxljobDocsFolder||DEFAULTS.xxljobDocsFolder;
+    if(!groups.length){this.renderWelcome('还没有 xxl-job 文档',`点左下角「+ 导入 xxl-job XML」，从 xxl-job 平台导出的 XML 生成 ${folder}/<执行器>/{任务流,任务,任务组件} 三级文档。`);return;}
+    const group=groups.find(g=>g.key===this.selectedKey)||groups[0];this.selectedKey=group.key;
+    this.renderHeader(group.label,`${group.detail} · ${folder}/${group.label}`,[{text:'xxl-job XML 导入',primary:true,onclick:()=>{this.page='xxljob-import';this.importState=null;this.render();}}]);
+    const statLine=this.mainEl.createDiv({cls:'schema-tools-muted'});
+    void this.plugin.loadXxljobState().then(st=>{if(st?.updatedAt)statLine.setText(`上次导入：${new Date(st.updatedAt).toLocaleString('zh-CN')} · 来源记录见 ${this.plugin.xxljobStatePath()}`);});
+    for(const dirName of [XXL_DIRS.flow,XXL_DIRS.task,XXL_DIRS.component]){
+      const files=group.files.filter(f=>f.level===dirName).sort((a,b)=>a.name.localeCompare(b.name,'zh-CN'));
+      if(!files.length)continue;
+      this.mainEl.createDiv({text:`${dirName}（${files.length}）`,cls:'schema-tools-label'});
+      const list=this.mainEl.createDiv({cls:'schema-studio-selected-files'});
+      for(const f of files){
+        const chip=list.createDiv({text:f.name,cls:'schema-studio-file-chip'});
+        chip.onclick=()=>{const file=this.app.vault.getAbstractFileByPath(f.file.path);if(file instanceof TFile)void this.app.workspace.getLeaf(false).openFile(file);};
+      }
+    }
+  }
   renderWelcome(title,text){this.mainEl.createDiv({text:title,cls:'schema-studio-welcome-title'});this.mainEl.createDiv({text,cls:'schema-tools-muted schema-studio-welcome-text'});}
 
   renderHeader(title,subtitle,buttons=[]){
@@ -2189,9 +2327,110 @@ class SchemaStudioModal extends Modal {
 
   renderPageHeader(title,subtitle=''){this.renderHeader(title,subtitle,[{text:'返回',onclick:()=>{this.page='browse';this.importState=null;this.render();}}]);}
   renderMultiFileChooser(kind,state,key){
-    const row=this.mainEl.createDiv({cls:'schema-studio-source-row'});const label=row.createEl('label',{cls:'schema-studio-file-label'});label.createSpan({text:kind==='json'?'选择 JSON 文件（可多选）':'选择 SQL/DDL 文件（可多选）'});const input=label.createEl('input',{type:'file',attr:{accept:kind==='json'?'.json,application/json':'.sql,.ddl,text/plain,application/sql',multiple:'multiple'}});
+    const text=kind==='json'?'选择 JSON 文件（可多选）':kind==='xml'?'选择 xxl-job XML 文件（可多选）':'选择 SQL/DDL 文件（可多选）';
+    const accept=kind==='json'?'.json,application/json':kind==='xml'?'.xml,text/xml,application/xml':'.sql,.ddl,text/plain,application/sql';
+    const row=this.mainEl.createDiv({cls:'schema-studio-source-row'});const label=row.createEl('label',{cls:'schema-studio-file-label'});label.createSpan({text});const input=label.createEl('input',{type:'file',attr:{accept,multiple:'multiple'}});
     input.onchange=async()=>{const files=[...(input.files||[])];const loaded=[];for(const f of files){try{loaded.push({name:f.name,text:await f.text()});}catch(e){new Notice(`读取 ${f.name} 失败：${e.message}`);}}state[key]=loaded;this.render();};
     row.createDiv({text:'可一次选择多个文件',cls:'schema-tools-muted'});if((state[key]||[]).length){const box=this.mainEl.createDiv({cls:'schema-studio-selected-files'});box.createDiv({text:`已选择 ${state[key].length} 个文件`,cls:'schema-tools-label'});for(const f of state[key])box.createDiv({text:f.name,cls:'schema-studio-file-chip'});}
+  }
+
+  // --- xxl-job XML 导入：子模块 xxljob-flow-atlas ---
+  xxljobUnavailable(){
+    this.renderPageHeader('xxl-job XML 导入','子模块未加载');
+    this.mainEl.createDiv({text:'没有找到 xxljob-bundle.cjs，xxl-job 域不可用。请在 xxljob-flow-atlas 仓库执行 ./sync.sh to-vault（会把 bundle 拷进本插件目录），然后重载插件。接口 / 数据库两条链路不受影响。',cls:'schema-tools-callout'});
+  }
+  async xxljobTemplates(notify=false){
+    const s=xxlSettings(this.plugin);
+    const r=await xxl.readTemplates(this.app,{flowTemplate:s.flowTemplate,taskTemplate:s.taskTemplate,componentTemplate:s.componentTemplate},notify);
+    return r.templates||{};
+  }
+  async analyzeXxljob(state){
+    if(!state.xmlFiles?.length){new Notice('请先选择 xxl-job 导出的 XML 文件');return;}
+    const s=xxlSettings(this.plugin);
+    if(state.policy&&state.policy!==s.conflictPolicy){this.plugin.settings.xxljobConflictPolicy=state.policy;await this.plugin.saveSettings();}
+    state.templates=await this.xxljobTemplates();
+    state.analysis=xxl.buildPlansFromFiles(state.xmlFiles.map(f=>({name:f.name,content:f.text})),{
+      docsFolder:s.docsFolder,templates:state.templates,
+      executorOfFile:(name)=>state.executorByName?.[name]||'',
+    });
+    this.page='xxljob-diff';this.render();
+  }
+  renderXxljobImport(){
+    if(!xxl){this.xxljobUnavailable();return;}
+    const s=xxlSettings(this.plugin);
+    const state=this.importState||{xmlFiles:[],executorByName:{},policy:s.conflictPolicy};this.importState=state;
+    this.renderPageHeader('xxl-job XML → 任务文档','从 xxl-job 平台导出的 XML 生成「任务流 / 批任务 / 任务组件」三级文档；归属关系以双链写在正文的「对应任务流 / 对应批任务」章节。');
+    this.mainEl.createDiv({text:`文档输出到 ${s.docsFolder}/<执行器>/{${XXL_DIRS.flow},${XXL_DIRS.task},${XXL_DIRS.component}}，内容套用设置里的三份 xxljob 模板；模板里的人工填写项会保留为提示，任务参数只在批任务 frontmatter。`,cls:'schema-tools-callout'});
+    this.renderMultiFileChooser('xml',state,'xmlFiles');
+    if(!state.xmlFiles.length)return;
+    const form=this.mainEl.createDiv({cls:'schema-studio-form'});
+    this.mainEl.createDiv({text:'执行器确认',cls:'schema-tools-label'});
+    for(const f of state.xmlFiles){
+      const parsed=xxl.parseXxlXml(f.text,f.name);
+      const groups=(parsed.jobGroups||[]).join('/');
+      const guess=xxl.findExecutorByGroup(s.executors,(parsed.jobGroups||[])[0])?.name||xxl.guessExecutorFromFileName(f.name);
+      if(!state.executorByName[f.name])state.executorByName[f.name]=guess;
+      new Setting(form).setName(f.name).setDesc(`任务 ${parsed.jobs.length} 个${groups?` · jobGroup ${groups}`:''}`)
+        .addText(t=>t.setPlaceholder('执行器名称').setValue(state.executorByName[f.name]||'').onChange(v=>{state.executorByName[f.name]=v.trim()||guess;}));
+    }
+    this.mainEl.createDiv({text:'XML 里只有 jobGroup、没有执行器中文名，确认后会自动回写到执行器清单，下次同分组不再询问。',cls:'schema-tools-muted'});
+    new Setting(this.mainEl).setName('重名文档处理').addDropdown(d=>d.addOptions({skip:'跳过（保留现有文档）',update:'更新（保留手写正文）',rename:'新建副本'}).setValue(state.policy||s.conflictPolicy).onChange(v=>{state.policy=v;}));
+    const actions=this.mainEl.createDiv({cls:'schema-tools-actions'});
+    const analyze=actions.createEl('button',{text:'分析并查看导入清单',cls:'mod-cta'});
+    analyze.onclick=()=>{void this.analyzeXxljob(state);};
+  }
+  renderXxljobDiff(){
+    if(!xxl){this.xxljobUnavailable();return;}
+    const state=this.importState,res=state?.analysis;
+    if(!res){this.page='xxljob-import';return this.render();}
+    const policy=state.policy||xxlSettings(this.plugin).conflictPolicy;
+    const policyLabel={skip:'跳过',update:'更新',rename:'新建副本'}[policy]||policy;
+    let willCreate=0,willTouch=0;
+    for(const p of res.plans){if(this.app.vault.getAbstractFileByPath(p.path))willTouch++;else willCreate++;}
+    this.renderHeader('xxl-job 导入清单',`共 ${res.plans.length} 份：新建 ${willCreate} · 已存在 ${willTouch}（按「${policyLabel}」处理）`,[
+      {text:'返回修改',onclick:()=>{this.page='xxljob-import';this.render();}},
+      {text:'写入文档',primary:true,onclick:()=>{void this.applyXxljob(state);}}
+    ]);
+    if(res.warnings?.length){const box=this.mainEl.createDiv({cls:'schema-studio-selected-files'});box.createDiv({text:`警告 ${res.warnings.length} 条`,cls:'schema-tools-label'});for(const w of res.warnings.slice(0,20))box.createDiv({text:w,cls:'schema-studio-file-chip'});}
+    const wrap=this.mainEl.createDiv({cls:'schema-tools-table-wrap'});const table=wrap.createEl('table',{cls:'schema-tools-table'});
+    const hr=table.createEl('thead').createEl('tr');['类型','文档','输出路径','目标状态'].forEach(x=>hr.createEl('th',{text:x}));
+    const body=table.createEl('tbody');
+    for(const p of res.plans){
+      const exists=!!this.app.vault.getAbstractFileByPath(p.path);
+      const status=exists?(policy==='skip'?'跳过':policy==='update'?'更新':'新建副本'):'新建';
+      const tr=body.createEl('tr',{cls:`schema-status-${exists?(policy==='skip'?'unchanged':'changed'):'added'}`});
+      tr.createEl('td',{text:p.kind});
+      tr.createEl('td',{text:p.title});
+      tr.createEl('td',{text:p.path,cls:'schema-studio-diff-property'});
+      tr.createEl('td',{text:status});
+      const preview=body.createEl('tr');const cell=preview.createEl('td',{attr:{colspan:'4'}});
+      const det=cell.createEl('details');det.createEl('summary',{text:'预览'});
+      det.createEl('pre',{text:String(p.content||'').split('\n').slice(0,16).join('\n'),cls:'schema-studio-file-chip'});
+    }
+  }
+  async applyXxljob(state){
+    const s=xxlSettings(this.plugin);
+    const policy=state.policy||s.conflictPolicy;
+    let outcome;
+    try{outcome=await xxl.applyXxljobPlans(this.app,state.analysis.plans,policy);}
+    catch(e){console.error('[Schema Studio] xxl-job 导入失败',e);new Notice(`xxl-job 导入失败：${e?.message||e}`);return;}
+    let list=s.executors;
+    for(const g of state.analysis.jobGroups||[]){
+      const name=xxl.sanitizeExecutorDir(state.executorByName?.[g.name]||'');
+      if(name)list=xxl.upsertExecutor(list,name,g.groups||[]);
+    }
+    this.plugin.settings.xxljobExecutors=list;
+    this.plugin.settings.xxljobConflictPolicy=policy;
+    await this.plugin.saveSettings();
+    // 来源信息（原任务 id / 来源 XML / 导入时间）写状态文件，不污染文档正文
+    const importedAt=new Date().toISOString(),patch={};
+    for(const p of state.analysis.plans){
+      const st=outcome.created.includes(p.path)?'created':outcome.updated.includes(p.path)?'updated':outcome.renamed.includes(p.path)?'renamed':'skipped';
+      patch[p.path]={kind:p.kind,jobId:p.jobId,sourceFile:p.source?.sourceFile||'',author:p.source?.author||'',importedAt,lastResult:st,orphaned:false};
+    }
+    await this.plugin.patchXxljobState(patch);
+    new Notice(`xxl-job 导入完成：新建 ${outcome.created.length} · 更新 ${outcome.updated.length} · 副本 ${outcome.renamed.length} · 跳过 ${outcome.skipped.length}`);
+    this.domain='xxljob';this.selectedKey=null;this.page='browse';this.importState=null;this.render();
   }
 
   renderJsonImport(){
@@ -2431,5 +2670,5 @@ function countStatuses(diff){const c={added:0,changed:0,unchanged:0,removed:0};f
 function labelStatus(s){return {added:'新增',changed:'变化',unchanged:'未变',removed:'消失'}[s]||s;}
 function changeSummary(d){if(!d||d.status!=='changed')return '';return '变更：'+d.changes.map(k=>`${k} ${JSON.stringify(d.before?.[k]??'')} → ${JSON.stringify(d.after?.[k]??'')}`).join('；');}
 
-SchemaToolsPlugin._test = { core, DDL_DIALECTS, DEFAULTS, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell };
+SchemaToolsPlugin._test = { core, DDL_DIALECTS, DEFAULTS, xxlLoaded: () => !!xxl, XXL_DIRS, XXL_CLASS_BY_LEVEL, XXL_STATE_FILENAME, xxlSettings, xxlStatePathFor, parseDdlWithDialect, parseMySqlDdl, parseOracleDdl, parseJsonFilenameTarget, extractJsonImportUnit, detailedDiffRows, normalizeDirection, parseClipboardTable, clipboardValueForType, displayGridValue, valuesEqual, schemaValue, setSchemaValue, canonicalSchemaRecord, buildDemoFilePlan, demoPaths, SchemaStudioModal, SchemaStudioUnsavedModal, DemoInstallModal, DemoRestoreModal, SCHEMA_INTERNAL_KEYS, SCHEMA_STATE_KEY_NAMES, SCHEMA_DEPRECATED_KEY_NAMES, API_IMPORT_MANAGED_KEYS, DB_IMPORT_MANAGED_KEYS, purgeSchemaInternalKeys, schemaStatePathFor, stripCacheKeys, schemaKeyCandidates, readSchemaCell };
 module.exports = SchemaToolsPlugin;

@@ -1,10 +1,59 @@
-# 接口与数据库结构工具 v0.8.2
+# 接口与数据库结构工具 v0.9.0
 
 Schema Studio 用于维护接口字段和数据库字段。底层仍然是普通 Markdown、YAML Frontmatter 和 Wikilink；Fileclass 提供属性定义，Schema Tools 负责 JSON/DDL 导入、字段管理和精准引用。本仓库的接口字段属性名称统一使用中文，接口协议里的字段名、路径和类型保留原始写法。
 
 默认目录：接口文档为 `5.api/`，数据库文档为 `7.db/`，接口字段为 `_data/api-fields/`，数据库字段为 `_data/db-columns/`，总览视图为 `_bases/`。
 
 迁移兼容：插件仍可读取历史英文属性；新建、保存和重新导入接口字段时，会统一写入中文属性。`ApiField`、`DbColumn` 是插件识别用的技术类名，不是团队需要记忆的业务字段名称。
+
+## v0.9.0：新增 xxl-job 域（XML → 任务流 / 批任务 / 任务组件）
+
+侧栏的域页签由「接口 / 数据库」扩为 **「接口 / 数据库 / xxl-job」**。第三个域用来把 xxl-job 平台导出的 XML
+生成三级文档，遵守本插件的界面风格与运行机制（同一套 shell / header / 表格 / 设置页）。
+
+### 1. 文档结构
+
+导入输出在 `<文档根目录>/<执行器>/{任务流,任务,任务组件}`（默认根目录 `8.xxljob`）：
+
+| 层级 | fileClass | 说明 |
+|---|---|---|
+| 任务流 | `任务流` | 链路入口，`jobLevelType = MAIN_TRIGGER_JOB` |
+| 批任务 | `批任务` | 编排节点，`VIRTUAL_JOB` |
+| 任务组件 | `任务组件` | 实际执行单元，`COMPONENT_JOB` |
+
+- frontmatter 严格沿用模板的键顺序；能推断的填真实值，推断不了的**保留模板里的 `{{填写提示}}`**。
+- 正文套用设置里的三份模板：占位简述与示例 mermaid 会被替换成真实内容，其余章节原样保留。
+- **归属关系写在正文**：批任务有 `# 对应任务流`、任务组件有 `# 对应批任务`，内容是
+  `[[8.xxljob/<执行器>/<层级>/<名称>|<名称>]]` 双链；章节排在 `# 任务说明` 之前。fileClass 里
+  不再有 `对应任务流名称` / `对应批任务名称` 两个字段。
+- 调度状态一律写「停止」；任务参数只在批任务 frontmatter，正文不展开。
+
+### 2. 导入流程
+
+侧栏「+ 导入 xxl-job XML」→ 选 XML（可多选）→ 确认执行器（XML 里只有 `jobGroup` 编号，
+靠设置里的执行器清单匹配，确认后自动回写）→ 查看导入清单（类型 / 文档 / 路径 / 目标状态 + 预览）→ 写入。
+
+重名策略沿用本插件的三档：**跳过 / 更新（保留手写正文）/ 新建副本**。
+「更新」= frontmatter 整体替换（废弃键自动清除）+ 归属章节刷新 + 其余手写正文原样保留。
+
+### 3. 状态文件
+
+来源信息（原任务 id、来源 XML、导入时间）写入 `<文档根目录>/.xxljob-state.json`，
+与数据库域的 `_data/.schema-state.json` 分开，互不污染，也不写进业务文档正文。
+
+### 4. 子模块依赖
+
+xxl-job 的实现来自独立仓库 [`xxljob-flow-atlas`](https://github.com/chenzjm/xxljob-flow-atlas)
+（TypeScript + esbuild + 测试）。它以 `xxljob-bundle.cjs` 的形式被本插件 `require`：
+
+```js
+let xxl = null;
+try { xxl = require('./xxljob-bundle.cjs'); } catch (e) { /* 降级：xxl-job 域不可用 */ }
+```
+
+**没拷进来时整个 xxl-job 域自动隐藏为不可用，接口 / 数据库两条链路不受影响。**
+在 `xxljob-flow-atlas` 仓库执行 `./sync.sh to-vault` 会把 bundle 同步到本仓库与 vault 插件目录；
+本仓库的 `sync.sh` 也已把 `xxljob-bundle.cjs` 列入部署文件。
 
 ## v0.8.2：新建表文档按模板生成（含 schema 子目录与表注释）
 

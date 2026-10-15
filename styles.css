@@ -59,7 +59,7 @@
 .schema-studio-main { padding:20px 22px; overflow:auto; min-width:0; }
 .schema-studio-brand { padding:2px 4px 14px; }
 .schema-studio-brand-title { font-size:var(--font-ui-large); font-weight:700; margin-bottom:2px; }
-.schema-studio-domain-tabs { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:10px; }
+.schema-studio-domain-tabs { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; margin-bottom:10px; }
 .schema-studio-domain-tabs button { width:100%; }
 .schema-studio-domain-tabs button.is-active { background:var(--interactive-accent); color:var(--text-on-accent); }
 .schema-studio-import-button { width:100%; margin-bottom:10px; }
