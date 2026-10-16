@@ -1,4 +1,4 @@
-# 接口与数据库结构工具 v0.9.15
+# 接口与数据库结构工具 v0.9.16
 
 Schema Studio 用于维护接口字段和数据库字段。底层仍然是普通 Markdown、YAML Frontmatter 和 Wikilink；Fileclass 提供属性定义，Schema Tools 负责 JSON/DDL 导入、字段管理和精准引用。本仓库的接口字段属性名称统一使用中文，接口协议里的字段名、路径和类型保留原始写法。
 
@@ -462,6 +462,6 @@ _fileclasses
 
 ### 版本
 
-`manifest.json` 当前版本 **0.9.15**（需 Obsidian ≥ 1.8.9）。历史小节按版本倒序保留。
+`manifest.json` 当前版本 **0.9.16**（需 Obsidian ≥ 1.8.9）。历史小节按版本倒序保留。
 
 `main.js` 是 Obsidian 直接加载的构建产物，没有编译步骤；改完执行部署后重载插件即可生效。

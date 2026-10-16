@@ -931,19 +931,22 @@ function looksLikeXmlText(text) {
   return s.charAt(0) === '<';
 }
 function parseJsonFilenameTarget(filename) {
-  // 扩展名同时认 json 与 xml —— 导入页现在接受两种报文，文件名路由规则保持一致
-  const base = String(filename || '').replace(/\.(?:json|xml)$/i,'').trim();
+  // 扩展名同时认 json / xml / txt —— 导入页现在接受三种文件，文件名路由规则保持一致
+  // （.txt 不写进路由正则的话会被当成「无法从文件名识别」，批量导入静默失效）
+  const base = String(filename || '').replace(/\.(?:json|xml|txt)$/i,'').trim();
   const m = base.match(/^(.+?)[._\-\s]+(request|response|req|resp|res|请求|响应|入参|出参)$/i);
   if (!m) return null;
   const direction = normalizeDirection(m[2]);
   return direction ? { apiName: m[1].trim(), direction } : null;
 }
 // 导入单元解析：JSON 与 XML 走同一入口。判据是「文件名以 .xml 结尾」或「内容以 < 开头」。
+// .txt 文件不做格式假定，完全按内容嗅探：< 开头按 XML，否则必须 JSON.parse 通过。
 // 返回里多带两项：`sourceFormat`（json / xml，决定示例代码块的语言标记）与 `sample`
 // （剥掉 __schema 之后的原始报文，用于回写接口文档的「## 请求示例 / ## 响应示例」）。
 function extractJsonImportUnit(text, filename='', fallback={}) {
   const raw = String(text == null ? '' : text);
   if (!raw.trim()) throw new Error('导入内容为空：请粘贴 JSON / XML 字符串，或选择文件');
+  const isTxt = /\.txt$/i.test(String(filename || ''));
   const isXml = /\.xml$/i.test(String(filename || '')) || looksLikeXmlText(raw);
   let data, meta = null;
   if (isXml) {
@@ -954,7 +957,12 @@ function extractJsonImportUnit(text, filename='', fallback={}) {
   } else {
     let parsed;
     try { parsed = JSON.parse(raw); }
-    catch (e) { throw new Error(`JSON 解析失败：${e.message}。若内容其实是 XML，请确认它以 < 开头，或将文件名改为 .xml`); }
+    catch (e) {
+      const hint = isTxt
+        ? '.txt 文件的内容须是合法 JSON，或以 < 开头的 XML（按内容自动识别）'
+        : '若内容其实是 XML，请确认它以 < 开头，或将文件名改为 .xml';
+      throw new Error(`JSON 解析失败：${e.message}。${hint}`);
+    }
     data = parsed;
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       if (parsed.__schema && typeof parsed.__schema === 'object' && !Array.isArray(parsed.__schema)) meta = parsed.__schema;
@@ -3716,8 +3724,8 @@ class SchemaStudioModal extends Modal {
 
   renderPageHeader(title,subtitle=''){this.renderHeader(title,subtitle,[{text:'返回',onclick:()=>{this.page='browse';this.importState=null;this.render();}}]);}
   renderMultiFileChooser(kind,state,key){
-    const text=kind==='json'?'选择 JSON / XML 文件（可多选）':kind==='xml'?'选择 xxl-job XML 文件（可多选）':'选择 SQL/DDL 文件（可多选）';
-    const accept=kind==='json'?'.json,.xml,application/json,text/xml,application/xml':kind==='xml'?'.xml,text/xml,application/xml':'.sql,.ddl,text/plain,application/sql';
+    const text=kind==='json'?'选择 JSON / XML / TXT 文件（可多选）':kind==='xml'?'选择 xxl-job XML 文件（可多选）':'选择 SQL/DDL 文件（可多选）';
+    const accept=kind==='json'?'.json,.xml,.txt,application/json,text/xml,application/xml,text/plain':kind==='xml'?'.xml,text/xml,application/xml':'.sql,.ddl,text/plain,application/sql';
     const row=this.mainEl.createDiv({cls:'schema-studio-source-row'});const label=row.createEl('label',{cls:'schema-studio-file-label'});label.createSpan({text});const input=label.createEl('input',{type:'file',attr:{accept,multiple:'multiple'}});
     input.onchange=async()=>{const files=[...(input.files||[])];const loaded=[];for(const f of files){try{loaded.push({name:f.name,text:await f.text()});}catch(e){new Notice(`读取 ${f.name} 失败：${e.message}`);}}state[key]=loaded;this.render();};
     row.createDiv({text:'可一次选择多个文件',cls:'schema-tools-muted'});if((state[key]||[]).length){const box=this.mainEl.createDiv({cls:'schema-studio-selected-files'});box.createDiv({text:`已选择 ${state[key].length} 个文件`,cls:'schema-tools-label'});for(const f of state[key])box.createDiv({text:f.name,cls:'schema-studio-file-chip'});}
@@ -3864,7 +3872,7 @@ class SchemaStudioModal extends Modal {
     // 直接重建默认值，否则会报「无法确定导入目标」且输入框还是上一页的残留值。
     const cur=this.importState;
     const state=(cur&&cur.jsonFiles)?cur:{apiName:'',direction:'Request',jsonText:'',jsonFiles:[],xmlInferTypes:false,apiModule:'',payloadRoot:'',ignoreTopKeys:''};this.importState=state;this.renderPageHeader('JSON / XML → 接口 Schema','支持 JSON 与 XML 字符串、单文件和批量文件；批量文件按文件名或 __schema 元信息自动路由。');
-    this.mainEl.createDiv({text:'批量命名示例：创建订单.Request.json、创建订单-Response.xml。也可以在内容中加入 __schema: { api, direction }（XML 用 <__schema api="创建订单" direction="Request"/> 元素），payload/body/data 作为实际样例。XML 解析：剥离根元素（根只作报文容器）；属性写成 @属性名（如 @id）；同名重复元素自动识别为数组；元素既有属性又有文本时文本记为 _text（不用 #text，避免与 Obsidian 链接锚点冲突）；命名空间前缀保留原样。导入的原始报文会逐字节写进接口文档的「## 请求示例 / ## 响应示例」代码块（文档里没有该章节则不写）。导入器只覆盖可推断的结构属性，Fileclass 中的其他自定义属性会保留。',cls:'schema-tools-callout'});
+    this.mainEl.createDiv({text:'批量命名示例：创建订单.Request.json、创建订单-Response.xml、创建订单.Request.txt。也可以在内容中加入 __schema: { api, direction }（XML 用 <__schema api="创建订单" direction="Request"/> 元素），payload/body/data 作为实际样例。TXT 文件按内容自动识别：以 < 开头按 XML 解析，否则必须为合法 JSON。XML 解析：剥离根元素（根只作报文容器）；属性写成 @属性名（如 @id）；同名重复元素自动识别为数组；元素既有属性又有文本时文本记为 _text（不用 #text，避免与 Obsidian 链接锚点冲突）；命名空间前缀保留原样。导入的原始报文会逐字节写进接口文档的「## 请求示例 / ## 响应示例」代码块（文档里没有该章节则不写）。导入器只覆盖可推断的结构属性，Fileclass 中的其他自定义属性会保留。',cls:'schema-tools-callout'});
     this.renderMultiFileChooser('json',state,'jsonFiles');
     const form=this.mainEl.createDiv({cls:'schema-studio-form'});new Setting(form).setName('JSON 字符串的接口名称').setDesc('仅用于下方粘贴的 JSON，或单个无法从文件名识别的文件。').addText(t=>t.setValue(state.apiName||'').onChange(v=>state.apiName=v.trim()));new Setting(form).setName('方向').addDropdown(d=>d.addOptions({Request:'Request',Response:'Response'}).setValue(state.direction||'Request').onChange(v=>state.direction=v));new Setting(form).setName('接口模块').setDesc('决定字段记录的文件名前缀与新建接口文档的目录。本库 5.api 与 6.client 下有同名接口，靠这个区分；选「外部接口」时文档落 6.client 并套 client 模板。').addDropdown(d=>d.addOption('','不区分').addOption(API_MODULES[0],API_MODULES[0]).addOption(API_MODULES[1],API_MODULES[1]).setValue(state.apiModule||'').onChange(v=>{state.apiModule=v;if(v===API_MODULES[0]){if(!state.payloadRoot)state.payloadRoot='body';if(!state.ignoreTopKeys)state.ignoreTopKeys='head';}this.render();}));new Setting(form).setName('业务根节点').setDesc('仅「模块＝内部接口」且内容是 JSON 时生效。内部接口报文形如 { head, body }，填 body 则只取 body 里的字段、路径不带 body. 前缀。留空不处理。').addText(t=>t.setValue(state.payloadRoot||'').onChange(v=>state.payloadRoot=v.trim()));new Setting(form).setName('忽略的顶层节点').setDesc('同上生效条件。没有命中「业务根节点」时，按这里逐项丢弃顶层节点（默认丢弃公共报文头 head），其余整体导入。多个用逗号分隔，留空不处理。').addText(t=>t.setValue(state.ignoreTopKeys||'').onChange(v=>state.ignoreTopKeys=v.trim()));new Setting(form).setName('XML 类型推断').setDesc('默认关闭：XML 里一切都是字符串。打开后 <age>18</age> 会读成数字、<flag>true</flag> 读成布尔 —— 但「0001」这类有前导零的编码会被吞掉前导零，按需开启。').addToggle(t=>t.setValue(!!state.xmlInferTypes).onChange(v=>state.xmlInferTypes=v));
     this.mainEl.createDiv({text:'JSON 字符串（可选）',cls:'schema-tools-label'});const ta=this.mainEl.createEl('textarea',{cls:'schema-tools-textarea',attr:{placeholder:'{\n  "mobile": "13800000000"\n}'}});ta.value=state.jsonText||'';ta.oninput=()=>state.jsonText=ta.value;
