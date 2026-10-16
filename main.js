@@ -471,6 +471,9 @@ function xxlSettings(plugin) {
 function bool(v, fallback = false) { return typeof v === 'boolean' ? v : fallback; }
 function arrish(v) { return Array.isArray(v) ? v : (v == null ? [] : [v]); }
 function fmLinkPath(v) { return core.parseWikiTarget(v || ''); }
+// 表文档路径的**比对键**：wikilink 里存的路径不带 `.md`（`[[7.db/capital/T]]`），
+// 而 vault 事件给的路径带扩展名（`7.db/capital/T.md`）——两边比对前统一剥掉扩展名。
+function docStemKey(p) { return normalizePath(String(p || '')).replace(/\.md$/i, ''); }
 function basenameNoExt(path) { return String(path || '').split('/').pop().replace(/\.md$/i, ''); }
 // 列/字段文档的文件名格式是「<对象名>__<字段名>」。当 frontmatter 里的字段名缺失或被清空时，
 // 用它从文件名还原真实字段名——直接拿整个文件名会带上表名前缀，导致与 DDL/JSON 里的字段匹配不上。
@@ -1402,6 +1405,18 @@ class SchemaToolsPlugin extends Plugin {
       for (const t of this._tableDocTimers.values()) clearTimeout(t);
       this._tableDocTimers.clear();
     });
+    // ★ 表文档 / 字段文件的**文件生命周期**：创建、改名、删除。
+    //   这三类操作都不产生 modify 事件，以前完全没人听 —— 后果是：
+    //   ① 表文档改名/移动/删除后，字段文件的「数据表」链接变成断链（列表里多出点不开的空组）；
+    //   ② 新建的表文档（尤其是「创建副本」）一个字段文件都没有，内嵌的 DbColumns 视图渲染 0 列。
+    this._lifecycleTimers = new Map();
+    this.registerEvent(this.app.vault.on('create', (file) => this.onPathCreated(file)));
+    this.registerEvent(this.app.vault.on('rename', (file, oldPath) => this.onPathRenamed(file, oldPath)));
+    this.registerEvent(this.app.vault.on('delete', (file) => this.onPathDeleted(file)));
+    this.register(() => {
+      for (const t of this._lifecycleTimers.values()) clearTimeout(t);
+      this._lifecycleTimers.clear();
+    });
     this.addCommand({
       id: 'sync-fields-to-table-doc',
       name: '按字段表更新当前表的建表语句',
@@ -1472,6 +1487,10 @@ class SchemaToolsPlugin extends Plugin {
       state.records[key] = Object.assign({}, state.records[key] || {}, value);
     }
     state.updatedAt = new Date().toISOString();
+    await this.writeSchemaState(state, statePath);
+  }
+  async writeSchemaState(state, statePath) {
+    const path = statePath || this.schemaStatePath();
     try {
       await ensureFolder(this.app, path.split('/').slice(0, -1).join('/'));
       const body = JSON.stringify(state, null, 2) + '\n';
@@ -1480,6 +1499,29 @@ class SchemaToolsPlugin extends Plugin {
       else await this.app.vault.create(path, body);
       if (!statePath) this.schemaState = state;
     } catch (e) { console.warn('[Schema Studio] 写入状态文件失败', e); }
+  }
+  // 字段文件改名 → 状态账本的键（就是字段文件路径）必须跟着搬，
+  // 否则来源方式 / 方言 /「疑似删除」标记会整批丢失。
+  async moveSchemaStateKeys(pairs) {
+    const list = (pairs || []).filter((p) => p && p[0] && p[1] && normalizePath(p[0]) !== normalizePath(p[1]));
+    if (!list.length) return;
+    const patch = {};
+    for (const [from, to] of list) {
+      const rec = this.schemaStateFor(from);
+      if (rec) patch[normalizePath(to)] = Object.assign({}, rec);
+    }
+    if (Object.keys(patch).length) await this.patchSchemaState(patch);
+    await this.dropSchemaStateKeys(list.map((p) => p[0]));
+  }
+  async dropSchemaStateKeys(paths) {
+    const list = (paths || []).map((p) => normalizePath(p)).filter(Boolean);
+    if (!list.length) return;
+    const state = await this.loadSchemaState();
+    let hit = 0;
+    for (const key of list) if (state.records[key]) { delete state.records[key]; hit++; }
+    if (!hit) return;
+    state.updatedAt = new Date().toISOString();
+    await this.writeSchemaState(state);
   }
 
   async createDemoFiles(plan) {
@@ -1929,13 +1971,14 @@ class SchemaToolsPlugin extends Plugin {
     return this.withSyncLock(async () => {
       try {
         const op = this.createSyncOperator();
-        const r = await op.syncTableDocToFields(docPath);
+        const r = await op.syncTableDocToFields(docPath, { requireNameMatch: !!(options && options.requireNameMatch) });
         if (!r.ok) {
           // 自动模式下的「无 SQL / 无变化」是常态，静默跳过；其余原因一律提示，避免"改了没反应"
           if (manual) {
             const why = r.reason === 'no-sql' ? '没有找到「## 建表语句」代码块（占位注释不算）'
               : r.reason === 'not-found' ? '文档不存在'
               : r.reason === 'self-write' ? '文档内容与插件上次写入的一致，没有新的改动需要同步'
+              : r.reason === 'name-mismatch' ? `文档名「${r.docTable}」与建表语句里的表名「${r.table}」不一致（本库约定：表文档名＝表名），已跳过`
               : r.reason === 'parse-error' ? `SQL 解析失败：${r.message || ''}`
               : r.reason === 'too-many-removed' ? `建表语句里少了 ${r.removed} 列（原 ${r.existing} 列），疑似 SQL 未写完，已跳过`
               : r.reason === 'busy' ? '另一侧同步正在执行，已跳过'
@@ -1943,6 +1986,8 @@ class SchemaToolsPlugin extends Plugin {
             new Notice(`「${name}」未同步：${why}`);
           } else if (r.reason === 'too-many-removed') {
             new Notice(`「${name}」建表语句里少了 ${r.removed} 列（原 ${r.existing} 列），疑似还没写完，已跳过本次自动同步。`);
+          } else if (r.reason === 'name-mismatch') {
+            new Notice(`「${name}」没同步：文档名与建表语句里的表名「${r.table}」不一致。若是「创建副本」得到的文档，请改文档名（连同建表语句里的表名）或删掉它。`);
           }
           return r;
         }
@@ -1975,6 +2020,157 @@ class SchemaToolsPlugin extends Plugin {
       if (r && r.ok && !r.noop) synced++; else skipped++;
     }
     new Notice(`建表语句 → 字段 同步完成：${synced} 个已更新 · ${skipped} 个无变化或已跳过（共 ${docs.length} 个表文档）`);
+  }
+
+  // ==== 文件生命周期：创建 / 改名 / 删除（v0.9.21）================================
+  // 这三类操作都不产生 modify 事件，以前完全没人听。统一防抖入口：同一路径连续事件只处理最后一次。
+  _lifecycleLater(key, ms, fn) {
+    if (!this._lifecycleTimers) this._lifecycleTimers = new Map();
+    const prev = this._lifecycleTimers.get(key);
+    if (prev) clearTimeout(prev);
+    const wait = Math.max(300, Number(ms) || Number(this.settings.autoSyncDebounceMs) || 1200);
+    this._lifecycleTimers.set(key, setTimeout(() => {
+      this._lifecycleTimers.delete(key);
+      Promise.resolve().then(fn).catch((e) => console.error('[Schema Studio] 文件生命周期处理失败：', key, e));
+    }, wait));
+  }
+  // 新建表文档 → 按文档里的建表语句补齐字段文件（「创建副本」留下的空文档就是这个场景）。
+  // 内容可能还没落盘（Obsidian 先建文件再写内容）→ 交给防抖，到期再读。
+  onPathCreated(file) {
+    if (!this.settings.syncFieldsFromTableDoc) return;
+    const path = normalizePath(file && file.path);
+    if (!this.isTableDocPath(path)) return;      // 字段文件的 create 由 onFieldFileModified 负责
+    this._lifecycleLater('create:' + path, 600, () => this.runTableDocSync(path, { manual: false, requireNameMatch: true }));
+  }
+  onPathRenamed(file, oldPath) {
+    const nw = normalizePath(file && file.path);
+    const old = normalizePath(oldPath);
+    if (!old || !nw || old === nw) return;
+    if (this.isTableDocPath(old) || this.isTableDocPath(nw)) return this.onTableDocRenamed(old, nw);
+    if (this.isFieldFilePath(old) || this.isFieldFilePath(nw)) return this.onFieldFileRenamed(old, nw);
+  }
+  onPathDeleted(file) {
+    const path = normalizePath(file && file.path);
+    if (!path) return;
+    if (this.isTableDocPath(path)) {
+      if (this.settings.syncFieldsFromTableDoc) this._lifecycleLater('del-doc:' + path, 800, () => this.runTableDocDeleted(path));
+      return;
+    }
+    // 字段文件被删掉 → 它的状态账本项也一并清掉，否则账本里会留下指向不存在路径的孤儿记录
+    if (this.isFieldFilePath(path)) void this.dropSchemaStateKeys([path]);
+  }
+  // 表文档改名 / 移动 → 让字段文件跟着走。本库约定「表文档名 ＝ 表名」，所以改名等价于改表名，
+  // 下面三步必须一起做，缺任何一步都会留下后患：
+  //   ① 字段文件的「数据表」链接 → 新路径；不改就是断链（列表里出现点不开的空组）
+  //   ② 字段文件名前缀 → 新表名（`<表名>__<列名>.md`；文件名前缀是插件反查表文档的兜底依据）
+  //   ③ 文档内「## 建表语句」里的表名 → 新表名；不改的话下次编辑 SQL 时，
+  //      DDL 里的旧表名找不到任何列文件，整表列会被当成"新增"，重复建一套 <旧表名>__*.md
+  async onTableDocRenamed(oldPath, newPath) {
+    const oldStem = basenameNoExt(oldPath), newStem = basenameNoExt(newPath);
+    const oldKey = docStemKey(oldPath);
+    // 指向这份文档的列文件：优先按「数据表」链接认（少数文件链接缺失时退回文件名前缀）
+    const rows = this.scanDbColumns().filter((r) => docStemKey(r.tablePath) === oldKey
+      || (!r.tablePath && basenameNoExt(r.filePath).split('__')[0] === oldStem));
+    if (!rows.length) return;
+    const renameFiles = oldStem !== newStem;
+    const docFile = this.app.vault.getAbstractFileByPath(newPath);
+    // 文档里的 DDL 是否真的写的是「旧文档名」那张表 —— 是才改写表名（副本 / 多表汇总文档不动）
+    let ddlIsOldName = false, docText = '';
+    if (renameFiles && docFile) {
+      docText = String(await this.app.vault.read(docFile));
+      const sql = readSectionCodeBlock(docText, '建表语句');
+      if (sql.trim() && /create\s+table/i.test(sql)) {
+        try {
+          const wanted = String(this.settings.autoSyncDialect || 'auto');
+          const dialectId = (wanted === 'auto' || !DDL_DIALECTS[wanted]) ? detectDdlDialect(sql) : wanted;
+          ddlIsOldName = parseDdlWithDialect(sql, dialectId).some((t) => String(t.table || '').toLowerCase() === oldStem.toLowerCase());
+        } catch (e) { ddlIsOldName = false; }
+      }
+    }
+    const newLink = `[[${newPath.replace(/\.md$/i, '')}]]`, moves = [];
+    let linked = 0, renamed = 0, skipped = 0;
+    for (const r of rows) {
+      const file = this.app.vault.getAbstractFileByPath(r.filePath);
+      if (!file) continue;
+      await this.app.fileManager.processFrontMatter(file, (fm) => setSchemaValue(fm, 'db', 'table', newLink));
+      linked++;
+      if (!renameFiles) continue;
+      const base = basenameNoExt(r.filePath);
+      const tail = base.startsWith(oldStem) ? base.slice(oldStem.length) : '';
+      if (!tail.startsWith('__')) continue;           // 文件名前缀对不上（人工改过名）→ 只改链接
+      const target = normalizePath(`${this.settings.dbColumnsFolder}/${newStem}${tail}.md`);
+      if (this.app.vault.getAbstractFileByPath(target)) { skipped++; continue; }
+      await this.app.fileManager.renameFile(file, target);
+      moves.push([r.filePath, target]);
+      renamed++;
+    }
+    if (moves.length) await this.moveSchemaStateKeys(moves);
+    let ddlRewritten = false;
+    if (ddlIsOldName && docFile) {
+      const text = docText || String(await this.app.vault.read(docFile));
+      const sql = readSectionCodeBlock(text, '建表语句');
+      const word = new RegExp(`(^|[^0-9A-Za-z_$#])${escapeRe(oldStem)}(?=[^0-9A-Za-z_$#]|$)`, 'gi');
+      const nextSql = sql.replace(word, (m, p1) => p1 + newStem);
+      if (nextSql !== sql) {
+        const next = upsertSectionCodeBlock(text, '建表语句', 'sql', nextSql);
+        if (next !== text) { await this.app.vault.modify(docFile, next); this.markDocSelfWrite(newPath, next); ddlRewritten = true; }
+      }
+    }
+    // 文档自己的「表名」属性也一起改。它不是插件托管的属性（插件读写的表名键是「数据表」），
+    // 但和文档名一样是在声明「这张表叫什么」—— 不改的话文档内部就自相矛盾了。
+    // 只在它当前值**正好是旧表名**时改写，避免误动人工填的其它内容。
+    // 注意顺序：必须放在 DDL 改写**之后** —— processFrontMatter 会重写整份文档，
+    // 先做的话上面那次基于旧文本的 DDL 回写会把 frontmatter 改动覆盖掉。
+    let nameFieldUpdated = false;
+    if (renameFiles && docFile) {
+      const fm = stripCacheKeys(this.app.metadataCache.getFileCache(docFile)?.frontmatter || {});
+      const key = ['表名', 'table_name'].find((k) => fm[k] !== undefined);
+      if (key && String(fm[key]).trim() === oldStem) {
+        await this.app.fileManager.processFrontMatter(docFile, (f) => { f[key] = newStem; });
+        nameFieldUpdated = true;
+      }
+    }
+    if (linked || renamed || ddlRewritten || nameFieldUpdated) {
+      const bits = [`${linked} 个字段文件的「数据表」链接`];
+      if (renamed) bits.push(`${renamed} 个字段文件改名`);
+      if (ddlRewritten) bits.push(`建表语句里的表名改为「${newStem}」`);
+      if (nameFieldUpdated) bits.push('文档「表名」属性');
+      if (skipped) bits.push(`${skipped} 个因目标重名跳过`);
+      new Notice(`表文档「${oldStem}」→「${newStem}」：已更新${bits.join(' · ')}。`);
+    }
+  }
+  // 字段文件改名：把「字段名」按新文件名补正（只在字段名本来就是文件名推出来的时候，人工写过的值不动），
+  // 迁移账本键，再触发一次正向同步 —— 建表语句里的列名才会跟着改。
+  async onFieldFileRenamed(oldPath, newPath) {
+    if (!this.isFieldFilePath(newPath)) return;
+    const file = this.app.vault.getAbstractFileByPath(newPath);
+    if (!file) return;
+    const oldOwner = basenameNoExt(oldPath).split('__')[0] || '';
+    const oldName = memberNameFromFilename(oldPath, oldOwner);
+    const owner = basenameNoExt(newPath).split('__')[0] || '';
+    const newName = memberNameFromFilename(newPath, owner);
+    if (newName && newName !== oldName) {
+      const fm = stripCacheKeys(this.app.metadataCache.getFileCache(file)?.frontmatter || {});
+      const cur = String(schemaValue(fm, 'db', 'name') || '');
+      if (!cur || cur === oldName) {
+        await this.app.fileManager.processFrontMatter(file, (f) => setSchemaValue(f, 'db', 'name', newName));
+      }
+    }
+    await this.moveSchemaStateKeys([[oldPath, newPath]]);
+    this.onFieldFileModified({ path: newPath });
+  }
+  // 表文档被删除：把该表的字段文件全部标记「疑似删除」——**只做标记，不删文件**。
+  // 文档一旦回来（文件恢复 / git 检出 / 撤销删除）就会自动解除（见 onPathCreated → 反向同步）。
+  async runTableDocDeleted(docPath) {
+    // 「改名」在部分平台 / 同步盘上表现为 delete + create：到期时文件已经回来 → 当作改名，不标记
+    if (this.app.vault.getAbstractFileByPath(docPath)) return;
+    const key = docStemKey(docPath);
+    const rows = this.scanDbColumns().filter((r) => docStemKey(r.tablePath) === key);
+    if (!rows.length) return;                        // 已经没人指向它（例如刚被改名处理过）→ 无事可做
+    const now = new Date().toISOString(), patch = {};
+    for (const r of rows) patch[r.filePath] = { orphaned: true, lastImportedAt: now };
+    await this.patchSchemaState(patch);
+    new Notice(`表文档「${basenameNoExt(docPath)}」已删除：其 ${rows.length} 个字段文件已标记为「疑似删除」（文件保留）。恢复该文档后会自动解除。`);
   }
 }
 
@@ -3768,6 +3964,12 @@ class SchemaStudioModal extends Modal {
     const rows=group.rows.filter(r=>!r.schema_orphaned).sort((a,b)=>(a.order-b.order)||a.name.localeCompare(b.name));
     this.renderHeader(group.label,group.tablePath||'数据库文档',[{text:'保存编辑',onclick:()=>this.saveDynamicEdits(rows)},{text:'DDL 导入 / 更新',primary:true,onclick:()=>{this.page='ddl-import';this.importState={dialect:'oracle',ddlText:'',ddlFiles:[],focusTable:group.label};this.render();}}]);
     this.mainEl.createDiv({text:'字段列来自 DbColumn Fileclass 定义；自定义属性会自动出现并在重导入时保留。',cls:'schema-tools-callout'});this.renderGenericEditor(rows,'db');
+    // 表文档被删掉（或 SQL 里删了列）时这些列会被标记「疑似删除」：文件保留、不展示，但必须让用户看得见
+    const orphan=group.rows.filter(r=>r.schema_orphaned);
+    if(orphan.length){
+      const docPath=`${group.tablePath||''}.md`,docMissing=!this.app.vault.getAbstractFileByPath(docPath);
+      this.mainEl.createDiv({text:`另有 ${orphan.length} 个「疑似删除」列${docMissing?`：该表文档已不存在（${group.tablePath||'（未记录路径）'}），把文档恢复回来即会自动解除标记。`:'（建表语句里已没有这些列）。'}`,cls:'schema-tools-muted schema-studio-footnote'});
+    }
   }
 
   renderPageHeader(title,subtitle=''){this.renderHeader(title,subtitle,[{text:'返回',onclick:()=>{this.page='browse';this.importState=null;this.render();}}]);}
@@ -4270,7 +4472,14 @@ class SchemaStudioModal extends Modal {
     try{parsed=parseDdlWithDialect(sql,dialectId);}
     catch(e){return {ok:false,reason:'parse-error',message:e.message};}
     if(!parsed.length)return {ok:false,reason:'parse-error',message:`未识别到 ${DDL_DIALECTS[dialectId].label} 的 CREATE TABLE`};
-    const hit=parsed.find(t=>String(t.table||'').toLowerCase()===docTable.toLowerCase())||parsed[0];
+    let hit=parsed.find(t=>String(t.table||'').toLowerCase()===docTable.toLowerCase());
+    if(!hit){
+      // 「新建文档」专用闸（requireNameMatch，只由 create 事件传 true）：文档名与 SQL 里的表名对不上时
+      // 不自动反向同步 —— 典型就是「创建副本」，否则会按 DDL 里的表名写到**别的表**的字段文件上。
+      // 用户在已有文档里改 SQL（modify）时保持原有行为，不收窄。
+      if(options.requireNameMatch)return {ok:false,reason:'name-mismatch',docTable,table:String((parsed[0]&&parsed[0].table)||'')};
+      hit=parsed[0];
+    }
     const a=this.buildDbAnalysis(hit,basenameNoExt(path)+'.md',sql);
     const counts=countStatuses(a.diff);
     // 安全闸：SQL 只敲了一半（列还没写完）时会出现「大量列消失」，这时不落盘，
