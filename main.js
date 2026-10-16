@@ -2,6 +2,7 @@
 const path = require('path');
 const {
   Plugin, Modal, Notice, Setting, PluginSettingTab, TFile, EditorSuggest, normalizePath, stringifyYaml, setIcon,
+  parseYaml, getFrontMatterInfo,
   MarkdownRenderer, Component
 } = require('obsidian');
 // xxl-job XML 导入子模块：由本仓库 src/xxljob/ 构建产出，产物 xxljob-bundle.cjs 不入库。
@@ -15,7 +16,7 @@ let xxlLoadLog = [];
 function xxlErrText(e) { return (e && (e.message || String(e))) || String(e); }
 function ensureXxlGlobal() {
   if (!globalThis[XXL_OBSIDIAN_KEY]) {
-    globalThis[XXL_OBSIDIAN_KEY] = { Plugin, Modal, Notice, Setting, PluginSettingTab, TFile, EditorSuggest, normalizePath, stringifyYaml, setIcon };
+    globalThis[XXL_OBSIDIAN_KEY] = { Plugin, Modal, Notice, Setting, PluginSettingTab, TFile, EditorSuggest, normalizePath, stringifyYaml, setIcon, parseYaml, getFrontMatterInfo };
   }
   return globalThis[XXL_OBSIDIAN_KEY];
 }
@@ -1700,6 +1701,35 @@ class SchemaToolsPlugin extends Plugin {
       };
     }).filter(x => x.table && x.name);
   }
+  // 以磁盘内容为准重取列属性。metadataCache 的 frontmatter 滞后于 vault 的 modify 事件
+  // （后台 worker 排队重解析），自动同步必须读盘，否则改完字段表读到的还是旧值 → noop。
+  // 读盘失败/无 frontmatter 时退回 scanDbColumns 给的值，总比把整列表丢掉的要好。
+  async freshDbColumnRows(rows) {
+    const out = [];
+    for (const r of rows || []) {
+      let fm = r.fm || {};
+      try {
+        const file = this.app.vault.getAbstractFileByPath(r.filePath);
+        if (file) {
+          const info = getFrontMatterInfo(String(await this.app.vault.read(file)));
+          if (info && info.frontmatter) {
+            const parsed = parseYaml(info.frontmatter);
+            if (parsed && typeof parsed === 'object') fm = stripCacheKeys(parsed);
+          }
+        }
+      } catch (e) { /* 读盘失败：退回缓存值 */ }
+      out.push({
+        name: schemaValue(fm, 'db', 'name') || memberNameFromFilename(r.filePath, r.table),
+        data_type: schemaValue(fm, 'db', 'data_type') || '',
+        nullable: bool(schemaValue(fm, 'db', 'nullable'), true),
+        primary_key: bool(schemaValue(fm, 'db', 'primary_key')),
+        indexed: bool(schemaValue(fm, 'db', 'indexed')),
+        default_value: schemaValue(fm, 'db', 'default_value') ?? '',
+        desc: String(schemaValue(fm, 'db', 'description') || ''),
+      });
+    }
+    return out;
+  }
 
   // ==== 字段表 → 表文档「## 建表语句」（自 v0.7.22 移植） ========================
   // 表文档判定：在 dbDocsFolder 子树内，且不与 dbColumnsFolder 重叠（重叠时分不清源与产物）
@@ -1767,13 +1797,12 @@ class SchemaToolsPlugin extends Plugin {
     if (!sql.trim() || !/create\s+table/i.test(sql)) return { ok: false, reason: 'empty' };
     const table = basenameNoExt(path);
     // 「疑似删除」的列不参与重建 —— 否则删除标记形同失效（重建会把它加回 SQL）
-    const columns = this.scanDbColumns().filter(x => x.table === table && !x.schema_orphaned)
-      .map(x => ({
-        name: x.name, data_type: x.data_type, nullable: x.nullable !== false,
-        primary_key: !!x.primary_key, indexed: !!x.indexed,
-        default_value: x.default_value == null ? '' : String(x.default_value),
-        desc: String(schemaValue(x.fm || {}, 'db', 'description') || ''),
-      }));
+    const rows = this.scanDbColumns().filter(x => x.table === table && !x.schema_orphaned);
+    // ⚠️ scanDbColumns 走 metadataCache，而 Obsidian 的 frontmatter 缓存是**异步**追平的：
+    //    vault 的 modify 事件同步触发，缓存由后台 worker 排队重解析。用户刚在 Bases 网格 /
+    //    属性面板里改完字段表时，缓存很可能还是旧值 —— 拿旧值重建，结果与文档一致 ⇒ noop，
+    //    表现就是「改了字段表，建表语句没反应」。所以这里对涉及到的列文件重新读盘取最新值。
+    const columns = await this.freshDbColumnRows(rows);
     if (!columns.length) return { ok: false, reason: 'no-columns', table };
     const wanted = String(this.settings.autoSyncDialect || 'auto');
     const dialectId = (wanted === 'auto' || !DDL_DIALECTS[wanted]) ? detectDdlDialect(sql) : wanted;

@@ -1,10 +1,45 @@
-# 接口与数据库结构工具 v0.9.17
+# 接口与数据库结构工具 v0.9.18
 
 Schema Studio 用于维护接口字段和数据库字段。底层仍然是普通 Markdown、YAML Frontmatter 和 Wikilink；Fileclass 提供属性定义，Schema Tools 负责 JSON/DDL 导入、字段管理和精准引用。本仓库的接口字段属性名称统一使用中文，接口协议里的字段名、路径和类型保留原始写法。
 
 默认目录：接口文档为 `5.api/`，数据库文档为 `7.db/`，接口字段为 `_data/api-fields/`，数据库字段为 `_data/db-columns/`，总览视图为 `_bases/`。
 
 迁移兼容：插件仍可读取历史英文属性；新建、保存和重新导入接口字段时，会统一写入中文属性。`ApiField`、`DbColumn` 是插件识别用的技术类名，不是团队需要记忆的业务字段名称。
+
+## v0.9.18：修掉「刚改完字段表就同步」会写入过期值（metadataCache 异步追平）
+
+**起因**：用户反馈「在网格里调整了字段表的数据，表文档的建表语句不会同步更新」。
+
+**先说清楚这不是一个 bug 而是两层**：
+
+1. **开关默认关闭**。「字段表属性变化实时更新建表语句」对应的 `syncTableDocFromFields` 默认为 `false`
+   （对端 v0.7.22 两个方向默认 true，这边有意改成默认关）。`onFieldFileModified()` 第一行即
+   `if (!this.settings.syncTableDocFromFields) return;` —— 事件到达就返回，后面整条链路不执行。
+   实测：关掉开关时改字段文件，表文档逐字节不变。
+2. **真 bug：即使开关打开，也可能同步出错误结果**（本版修的就是它）。
+
+**根因**：`scanDbColumns()` 读的是 `metadataCache.getFileCache()`，而 Obsidian 的 frontmatter 缓存由
+后台 worker **异步**追平，vault 的 `modify` 事件却是**同步**触发。用户在 Bases 网格 / 属性面板刚改完，
+防抖到期（默认 1200ms）时缓存很可能还是旧值，于是拿旧值重建：
+
+- 旧值恰好与文档一致 → `changed = false` ⇒ `noop`，表现为「改了没反应」；
+- 旧值与文档不同 → **把建表语句写成过期的旧值**，比不动更糟。
+
+**修法**：新增 `freshDbColumnRows(rows)`，对涉及的列文件**重新读盘**取最新 frontmatter
+（`getFrontMatterInfo` + `parseYaml`），读盘失败或没有 frontmatter 时退回 `scanDbColumns` 给的值；
+`syncFieldsToTableDoc` 改走这条路径。只影响「需要重建的列」的读取，原文逐字节复用的列不受影响，幂等基准不变。
+
+**验证**（新增 `.workbuddy` 探针，不进仓库）：修复前缓存滞后时写入过期的旧值（✗），修复后以磁盘最新值为准（✓）。
+
+**顺带修一处测试台缺陷**：`ddl-harness.js` 的 obsidian 桩件补上 `parseYaml` 与 `getFrontMatterInfo`。
+这份修复正是靠它们读盘，桩件缺失会让 `TypeError` 被 `catch` 吞掉、静默退回缓存旧值 ——
+修复版与未修复版**跑出完全相同的结果**、看着像「修复无效」。**改 main.js 顶部从 obsidian 的解构列表时，务必同步补桩件。**
+
+**回归**：ddl 82/0、ddl-sync 71/2、sync-presence 29/1、api-import 67/0、api-module 57/0、
+grid-edit 37/0、xxl 26/0、parity 134/0。那 3 条失败是**库数据脏**、不是代码回退（修复前后失败项逐字一致）：
+表文档 `CAPITAL_INSURANCE_PRE_APPLY` 的建表语句里有一个手误的 `ACCEPT_CODE NVARCHAR2(32),1`，
+那个 `,1` 被解析成一列名 `1`（幽灵列），反向同步会去建 `CAPITAL_INSURANCE_PRE_APPLY__1.md` 且永不收敛。
+清掉那处 `,1` 后这 3 条即恢复。
 
 ## v0.9.17：建表语句同步的一处真 bug（重建丢列上约束）
 
