@@ -2159,18 +2159,26 @@ class SchemaToolsPlugin extends Plugin {
     await this.moveSchemaStateKeys([[oldPath, newPath]]);
     this.onFieldFileModified({ path: newPath });
   }
-  // 表文档被删除：把该表的字段文件全部标记「疑似删除」——**只做标记，不删文件**。
-  // 文档一旦回来（文件恢复 / git 检出 / 撤销删除）就会自动解除（见 onPathCreated → 反向同步）。
+  // 表文档被删除 → 该表的字段文件**一并删除**（走 Obsidian 回收站，可从回收站找回），并清掉状态账本项。
+  // 与「建表语句里删掉一列」区分开：后者只打「疑似删除」标记、不删文件 —— 编辑 SQL 的中途态太常见
+  // （写了一半、误删一行），直接删列文件代价太大（见 applyDbAnalysis 的 removed 分支）。
   async runTableDocDeleted(docPath) {
-    // 「改名」在部分平台 / 同步盘上表现为 delete + create：到期时文件已经回来 → 当作改名，不标记
+    // 「改名」在部分平台 / 同步盘上表现为 delete + create：到期时文件已经回来 → 当作改名，不动字段文件
     if (this.app.vault.getAbstractFileByPath(docPath)) return;
     const key = docStemKey(docPath);
     const rows = this.scanDbColumns().filter((r) => docStemKey(r.tablePath) === key);
     if (!rows.length) return;                        // 已经没人指向它（例如刚被改名处理过）→ 无事可做
-    const now = new Date().toISOString(), patch = {};
-    for (const r of rows) patch[r.filePath] = { orphaned: true, lastImportedAt: now };
-    await this.patchSchemaState(patch);
-    new Notice(`表文档「${basenameNoExt(docPath)}」已删除：其 ${rows.length} 个字段文件已标记为「疑似删除」（文件保留）。恢复该文档后会自动解除。`);
+    const gone = [];
+    for (const r of rows) {
+      const file = this.app.vault.getAbstractFileByPath(r.filePath);
+      if (!file) { gone.push(r.filePath); continue; }  // 文件已经不在了：账本项照样清掉
+      try { await this.app.fileManager.trashFile(file); gone.push(r.filePath); }
+      catch (e) { console.error('[Schema Studio] 表文档已删，字段文件移入回收站失败：', r.filePath, e); }
+    }
+    if (gone.length) await this.dropSchemaStateKeys(gone);
+    const name = basenameNoExt(docPath);
+    if (gone.length === rows.length) new Notice(`表文档「${name}」已删除：其 ${gone.length} 个字段文件已一并移入回收站。`);
+    else new Notice(`表文档「${name}」已删除：${gone.length}/${rows.length} 个字段文件已移入回收站，其余删除失败（详见控制台）。`);
   }
 }
 
