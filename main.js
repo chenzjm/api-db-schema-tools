@@ -424,15 +424,15 @@ const DEFAULTS = {
   // 新建表文档时套用的模板；留空则回退到内置的最小结构
   dbDocTemplate: '_template/业务模板/db-数据库-shuju/db-数据库-shuju.md',
   // --- 字段表 → 表文档「## 建表语句」实时同步（自 v0.7.22 移植） ---
-  // 默认关闭：这条链路会改写表文档里的 SQL（虽然是补丁式、幂等的）。
-  // 建议先用命令面板在单张表上跑一次，确认产物符合预期后再打开自动同步。
-  syncTableDocFromFields: false,
+  // 默认开启：这条链路会改写表文档里的 SQL，但重建是补丁式的、幂等的（没有真变化时不落盘），
+  // 且写盘前有「一次删列超过一半就跳过」的安全闸。想先看产物再放开，可关掉本开关改用命令面板手动跑。
+  syncTableDocFromFields: true,
   autoSyncDebounceMs: 1200,
   // 重建时用的方言：auto = 按 SQL 特征猜（本库默认落到 Oracle）
   autoSyncDialect: 'auto',
-  // --- 表文档「## 建表语句」 → 字段表（反向同步，同样默认关闭） ---
+  // --- 表文档「## 建表语句」 → 字段表（反向同步，同样默认开启） ---
   // 与 syncTableDocFromFields 互为镜像；两个都打开时靠自写抑制 + 重入锁避免来回抖。
-  syncFieldsFromTableDoc: false,
+  syncFieldsFromTableDoc: true,
   prioritizeInlineSuggest: true,
   // --- xxl-job XML 导入（子模块 xxljob-flow-atlas） ---
   xxljobDocsFolder: '8.xxljob',
@@ -2013,13 +2013,13 @@ class SchemaToolsSettingTab extends PluginSettingTab {
     containerEl.createEl('h3', { text: '字段表 ⇄ 建表语句 同步' });
     new Setting(containerEl)
       .setName('字段表属性变化实时更新建表语句')
-      .setDesc('改 _data/db-columns 里列文件的属性（数据类型 / 可为空 / 主键 / 索引 / 说明）后，自动重建表文档「## 建表语句」。补丁式重建：只改真不一致的地方，没变化时不落盘；注释只补不改、索引只补不删。默认关闭，建议先用下面的命令在单张表上验证。')
+      .setDesc('改 _data/db-columns 里列文件的属性（数据类型 / 可为空 / 主键 / 索引 / 说明）后，自动重建表文档「## 建表语句」。补丁式重建：只改真不一致的地方，没变化时不落盘；注释只补不改、索引只补不删。默认开启；想先看产物再放开，可关掉本开关改用下面的命令在单张表上手动跑。')
       .addToggle(t => t.setValue(!!this.plugin.settings.syncTableDocFromFields).onChange(async v => {
         this.plugin.settings.syncTableDocFromFields = v; await this.plugin.saveSettings();
       }));
     new Setting(containerEl)
       .setName('建表语句变化实时更新字段表')
-      .setDesc('改表文档「## 建表语句」里的 SQL 后，停手一会儿自动把列写回 _data/db-columns（新增列 / 改类型与注释 / 把消失的列标记为疑似删除，不删文件）。与上一项互为镜像，同样默认关闭。两个都打开时靠自写抑制与重入锁避免来回触发。')
+      .setDesc('改表文档「## 建表语句」里的 SQL 后，停手一会儿自动把列写回 _data/db-columns（新增列 / 改类型与注释 / 把消失的列标记为疑似删除，不删文件）。与上一项互为镜像，同样默认开启。两个都打开时靠自写抑制与重入锁避免来回触发。')
       .addToggle(t => t.setValue(!!this.plugin.settings.syncFieldsFromTableDoc).onChange(async v => {
         this.plugin.settings.syncFieldsFromTableDoc = v; await this.plugin.saveSettings();
       }));
