@@ -1,10 +1,34 @@
-# 接口与数据库结构工具 v0.9.16
+# 接口与数据库结构工具 v0.9.17
 
 Schema Studio 用于维护接口字段和数据库字段。底层仍然是普通 Markdown、YAML Frontmatter 和 Wikilink；Fileclass 提供属性定义，Schema Tools 负责 JSON/DDL 导入、字段管理和精准引用。本仓库的接口字段属性名称统一使用中文，接口协议里的字段名、路径和类型保留原始写法。
 
 默认目录：接口文档为 `5.api/`，数据库文档为 `7.db/`，接口字段为 `_data/api-fields/`，数据库字段为 `_data/db-columns/`，总览视图为 `_bases/`。
 
 迁移兼容：插件仍可读取历史英文属性；新建、保存和重新导入接口字段时，会统一写入中文属性。`ApiField`、`DbColumn` 是插件识别用的技术类名，不是团队需要记忆的业务字段名称。
+
+## v0.9.17：建表语句同步的一处真 bug（重建丢列上约束）
+
+**现象**：字段表 → 建表语句 同步开着，只改某一列的「数据类型」，重建后该列上挂的
+`constraint SYS_C0050515 check ("PRE_INSURE_ID" IS NOT NULL)` 整段消失 —— 相当于改个类型就把列的 CHECK 约束删了。
+
+**根因**：Oracle dump 常把列级约束拆到后续缩进行（`scanCreateTable` 已把这些行并入该列的 `item.text`）。
+但 `buildDdlFromColumns` 重生成该列时只吐一行 `renderColumnDef(...)`，续行约束没人接回去。
+
+**修法**：新增 `columnConstraintTail(itemText)`，只认 `constraint / check / references / foreign key /
+primary key / unique / not null / null / default / on delete|update / deferrable / initially / enable|disable`
+开头的续行并逐字拼回；遇到不认识的写法就停（宁可不保留也不猜）。只作用于「需要重生成」的列，
+原文逐字节复用的列不受影响，幂等基准不变。
+
+同时修掉两处回归自身的缺陷（都在测试侧，非产品行为）：
+
+- `ddl-regression` 场景 11 调 `buildDbAnalysis` 漏传第 3 个参数（按表切片后的原始 SQL），
+  真实链路一定会传，漏传导致 `a.sql` 为空 → 新表文档的「建表语句」代码块是空的，断言长期失败；
+  场景 11 另加了「先在内存里删掉 ACCOUNT_FILE_FLAG 残留」，让「全新表」前提不受 vault 漂移影响。
+- `run-all-regressions.sh` 在指定 `SCHEMA_STUDIO_MAIN` 时误报「基线未取到」（基线其实是部署副本），
+  且结尾绿灯文案把「环境性失败条数」写死成 2；改为按实际比对结果自适应输出。
+
+回归：ddl-regression 82/0、ddl-sync 73/0（新增 5 条约束保留用例）、api-import 67/0、
+api-module 57/0、grid-edit 37/0、xxl 26/0、v0722-parity 134/0，全套 476 条全绿。
 
 ## v0.9.12：与并行分支 v0.7.22 的功能对齐回归（新增 138 条对齐断言 + 8 处补齐/修正）
 

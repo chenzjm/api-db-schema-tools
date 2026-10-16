@@ -2823,6 +2823,21 @@ function renderColumnDef(name, col, dialect, padWidth) {
   if (col && col.nullable === false) parts.push('not null');
   return parts.join(' ');
 }
+// 列定义文本里属于该列的「续行子句」——constraint / check / references 等挂在列后面的约束。
+// Oracle dump 常把它们拆到后续缩进行里（`scanCreateTable` 已把这些行并入该列的 item.text），
+// 重生成列定义时必须逐字接回去，否则只是改个类型就把列上的 CHECK 约束删掉了。
+// 只认这些关键字开头的续行；遇到不认识的写法就停，宁可不保留也不猜。
+function columnConstraintTail(itemText) {
+  const lines = String(itemText == null ? '' : itemText).split('\n');
+  if (lines.length < 2) return '';
+  const KW = /^[ \t]*(?:constraint|check|references|foreign[ \t]+key|primary[ \t]+key|unique|not[ \t]+null|null|default|on[ \t]+(?:delete|update)|deferrable|initially|enable|disable)\b/i;
+  const tail = [];
+  for (let i = 1; i < lines.length; i++) {
+    if (!KW.test(lines[i])) break;
+    tail.push(lines[i]);
+  }
+  return tail.join('\n');
+}
 
 // 补丁式重建：以文档里现有 SQL 为基底，只把「字段表与 SQL 不一致」的地方改掉。
 // 返回 { ok, reason, sql, stats }；stats 用于给用户生成提示。
@@ -2899,6 +2914,10 @@ function buildDdlFromColumns(opts) {
     if (!text) {
       const quoted = item ? /^"/.test(item.text) : anyQuoted;
       text = renderColumnDef(quoted ? `"${c.name}"` : c.name, c, dialect, padWidth + (quoted ? 2 : 0));
+      // 该列自己的续行约束（constraint / check / references …）逐字接回去 ——
+      // 否则改个类型就把 Oracle dump 挂在列上的 CHECK 约束删掉了。
+      const tail = columnConstraintTail(item && item.text);
+      if (tail) text += '\n' + tail;
     }
     outColumns.push(text);
     outColumnSrc.push(item || null);
