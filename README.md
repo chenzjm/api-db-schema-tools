@@ -1,10 +1,33 @@
-# 接口与数据库结构工具 v0.9.19
+# 接口与数据库结构工具 v0.9.20
 
 Schema Studio 用于维护接口字段和数据库字段。底层仍然是普通 Markdown、YAML Frontmatter 和 Wikilink；Fileclass 提供属性定义，Schema Tools 负责 JSON/DDL 导入、字段管理和精准引用。本仓库的接口字段属性名称统一使用中文，接口协议里的字段名、路径和类型保留原始写法。
 
 默认目录：接口文档为 `5.api/`，数据库文档为 `7.db/`，接口字段为 `_data/api-fields/`，数据库字段为 `_data/db-columns/`，总览视图为 `_bases/`。
 
 迁移兼容：插件仍可读取历史英文属性；新建、保存和重新导入接口字段时，会统一写入中文属性。`ApiField`、`DbColumn` 是插件识别用的技术类名，不是团队需要记忆的业务字段名称。
+
+## v0.9.20：反向同步只写真有变化的列（修「只改 1 列却提示更新 29 列」）
+
+**现象**：在表文档的建表语句里只改 1 列的类型，弹窗却报「字段已按建表语句更新：**更新列 29**」。
+
+**根因**：`applyDbAnalysis` 的落盘循环遍历的是 **SQL 解析出的全部列** ——
+只要该列在字段表里已存在，就无条件 `processFrontMatter` 写一遍并 `counts.updated++`。
+`updated` 数的是「写盘次数」，不是「变化列数」。实测同一场景：`diff` 判 `changed:1, unchanged:28`，
+而 `result.updated=29`；29 个字段文件全被重写（内容不变，所以 git 看不出，但 mtime 全被刷新、
+编辑器逐文件派发 modify 事件）。
+
+**修法**：写盘前按真实合并结果**预演**一次（合并步骤与 `processFrontMatter` 内逐条对应：
+`Object.assign` 合并 → `purgeSchemaInternalKeys` → 删空「默认值」），
+结果与现有 frontmatter 一致就跳过写盘、计入新增的 `counts.unchanged`。
+
+**不能只看属性 diff 做判定**：清理历史内部键、删空「默认值」这些副作用同样必须落盘。
+第一版按 `diff.status === 'changed'` 过滤，`ddl-regression` 的「历史内部键全部被清掉」
+立刻失败 —— 正好说明那个过滤条件漏掉了这条职责。
+
+**效果**：同一场景写盘从 31 个文件降到 3 个，提示从「更新列 29」变成「更新列 1」。
+
+**回归**：8 套件 **507 条全绿** —— ddl 82/0、ddl-sync 73/0、sync-presence 31/0、api-import 67/0、
+api-module 57/0、grid-edit 37/0、xxl 26/0、parity 134/0。
 
 ## v0.9.19：字段表 ⇄ 建表语句 双向同步改为默认开启
 

@@ -4175,7 +4175,7 @@ class SchemaStudioModal extends Modal {
   async applyDbAnalysis(a,options={}){
     const now=options.now||new Date().toISOString(),dialect=options.dialect||'mysql';
     await ensureFolder(this.app,this.plugin.settings.dbColumnsFolder);const className=this.plugin.getFieldDefinitions('db').className;const allowed=this.plugin.fileclassPropertySet('db');
-    const statePatch=options.statePatch||{},counts={created:0,updated:0,repaired:0,restored:0,orphaned:0,ddlsynced:0};
+    const statePatch=options.statePatch||{},counts={created:0,updated:0,unchanged:0,repaired:0,restored:0,orphaned:0,ddlsynced:0};
     const exMap=new Map(a.existing.map(x=>[x.name,x]));
     // 兜底：按文件路径匹配。字段名被清空/改名后按名字会匹配不上，直接走新建会撞上已存在的文件。
     const exPathMap=new Map(a.existing.map(x=>[normalizePath(x.filePath),x]));
@@ -4207,7 +4207,20 @@ class SchemaStudioModal extends Modal {
       const isBlank=(v)=>v===undefined||v===null||String(v).trim()==='';
       if(old){const wasBlank=isBlank(schemaValue(props,'db','name'))||isBlank(schemaValue(props,'db','data_type'));dropBlankGuardedValues('db',props,old.fm);if(wasBlank&&!isBlank(schemaValue(props,'db','name'))&&!isBlank(schemaValue(props,'db','data_type')))counts.repaired++;}
       const wasOrphaned=old?this.plugin.isSchemaOrphaned(old.filePath):false;
-      if(old){await this.app.fileManager.processFrontMatter(old.file,fm=>{Object.assign(fm,props);purgeSchemaInternalKeys(fm);if(!r.default_value)for(const key of schemaKeyCandidates('db','default_value'))delete fm[key];});statePatch[old.filePath]={source:'ddl',dialect,orphaned:false,lastImportedAt:now};counts.updated++;if(wasOrphaned)counts.restored++;}
+      if(old){
+        // 只写「落盘后确实会不一样」的既有列。SQL 解析出的列通常远多于本次真正改动的列，
+        // 无条件 processFrontMatter 会把整表列文件重写一遍 —— 内容虽不变，但 mtime 全被刷新、
+        // 编辑器逐文件派发 modify 事件，而 Notice 又会把写盘次数报成「更新列 N」，看着像整表被改。
+        // 判定不能只看属性 diff：清理历史内部键、删空「默认值」这些副作用同样必须落盘，
+        // 所以按真实合并结果预演一次（合并步骤与下面的 processFrontMatter 逐条对应）。
+        const preview=(fm)=>{const next=Object.assign({},fm);Object.assign(next,props);purgeSchemaInternalKeys(next);if(!r.default_value)for(const key of schemaKeyCandidates('db','default_value'))delete next[key];return next;};
+        const cur=old.fm||{},nextFm=preview(cur);
+        if(JSON.stringify(cur)!==JSON.stringify(nextFm)){
+          await this.app.fileManager.processFrontMatter(old.file,fm=>{Object.assign(fm,props);purgeSchemaInternalKeys(fm);if(!r.default_value)for(const key of schemaKeyCandidates('db','default_value'))delete fm[key];});
+          counts.updated++;
+        }else counts.unchanged++;
+        statePatch[old.filePath]={source:'ddl',dialect,orphaned:false,lastImportedAt:now};if(wasOrphaned)counts.restored++;
+      }
       else{const path=normalizePath(`${this.plugin.settings.dbColumnsFolder}/${core.makeDbColumnFilename(a.table,r.key)}.md`);
         // 名字没匹配上、但该文件确实存在时，按路径更新它，而不是新建（新建会因重名直接抛错中断整批导入）
         const byPath=exPathMap.get(path);
