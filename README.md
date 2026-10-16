@@ -27,8 +27,9 @@ primary key / unique / not null / null / default / on delete|update / deferrable
 - `run-all-regressions.sh` 在指定 `SCHEMA_STUDIO_MAIN` 时误报「基线未取到」（基线其实是部署副本），
   且结尾绿灯文案把「环境性失败条数」写死成 2；改为按实际比对结果自适应输出。
 
-回归：ddl-regression 82/0、ddl-sync 73/0（新增 5 条约束保留用例）、api-import 67/0、
-api-module 57/0、grid-edit 37/0、xxl 26/0、v0722-parity 134/0，全套 476 条全绿。
+回归：ddl-regression 82/0、ddl-sync 73/0（新增 5 条约束保留用例）、sync-presence-check 30/0、
+api-import 67/0、api-module 57/0、grid-edit 37/0、xxl 26/0、v0722-parity 134/0，全套 8 套件 506 条全绿。
+（sync-presence-check 用修复前的 main.js 复跑，约束保留相关 2 条会失败，证明用例真能抓住这个 bug。）
 
 ## v0.9.12：与并行分支 v0.7.22 的功能对齐回归（新增 138 条对齐断言 + 8 处补齐/修正）
 
